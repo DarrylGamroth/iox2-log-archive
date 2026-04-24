@@ -47,10 +47,8 @@ fn main() -> Result<()> {
             eprintln!("{}", e.to_formatted_error(cli.format));
             std::process::exit(e.exit_code());
         }
-    } else {
-        if let Err(e) = Cli::command().print_help() {
-            error!("Failed to print help: {}", e);
-        }
+    } else if let Err(e) = Cli::command().print_help() {
+        error!("Failed to print help: {}", e);
     }
 
     Ok(())

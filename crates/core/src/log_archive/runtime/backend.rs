@@ -66,7 +66,7 @@ impl core::fmt::Debug for IoUringBackend {
 pub(super) enum RecorderIoBackend {
     Blocking(BlockingIoBackend),
     #[cfg(target_os = "linux")]
-    IoUring(IoUringBackend),
+    IoUring(Box<IoUringBackend>),
 }
 
 impl RecorderIoBackend {
@@ -91,7 +91,10 @@ impl RecorderIoBackend {
                         io_cqe_batch_max,
                         io_uring_register_files,
                     ) {
-                        return Ok((Self::IoUring(backend), EffectiveAsyncIoBackend::IoUring));
+                        return Ok((
+                            Self::IoUring(Box::new(backend)),
+                            EffectiveAsyncIoBackend::IoUring,
+                        ));
                     }
                 }
 
@@ -103,25 +106,30 @@ impl RecorderIoBackend {
             AsyncIoBackend::IoUringRequired => {
                 #[cfg(target_os = "linux")]
                 {
-                    return IoUringBackend::new(
+                    IoUringBackend::new(
                         io_uring_queue_depth,
                         io_submit_batch_max,
                         io_cqe_batch_max,
                         io_uring_register_files,
                     )
-                    .map(|backend| (Self::IoUring(backend), EffectiveAsyncIoBackend::IoUring))
+                    .map(|backend| {
+                        (
+                            Self::IoUring(Box::new(backend)),
+                            EffectiveAsyncIoBackend::IoUring,
+                        )
+                    })
                     .map_err(|_| {
                         ArchiveRecorderError::InvalidConfiguration(
                             "io_uring backend required but unavailable",
                         )
-                    });
+                    })
                 }
 
                 #[cfg(not(target_os = "linux"))]
                 {
-                    return Err(ArchiveRecorderError::InvalidConfiguration(
+                    Err(ArchiveRecorderError::InvalidConfiguration(
                         "io_uring backend required but unavailable",
-                    ));
+                    ))
                 }
             }
         }
@@ -292,7 +300,7 @@ impl IoUringBackend {
 
         let mut unique_fds = Vec::<RawFd>::new();
         for fd in fds {
-            if !unique_fds.contains(&fd) {
+            if !unique_fds.contains(fd) {
                 unique_fds.push(*fd);
             }
         }
@@ -387,7 +395,7 @@ impl IoUringBackend {
         &self,
         user_data: u64,
     ) -> Result<io_uring::squeue::Entry, ArchiveRecorderError> {
-        let pending = self.pending_writes.get(&user_data).ok_or_else(|| {
+        let pending = self.pending_writes.get(&user_data).ok_or({
             ArchiveRecorderError::RecoveryInconsistent("missing io_uring pending write state")
         })?;
         let remaining = pending.buffer.len().checked_sub(pending.written).ok_or(
@@ -492,8 +500,7 @@ impl IoUringBackend {
         self.ring.submit_and_wait(1)?;
         let mut cq = self.ring.completion();
         let Some(cqe) = cq.next() else {
-            return Err(Error::new(
-                ErrorKind::Other,
+            return Err(Error::other(
                 "io_uring direct operation returned without completion",
             ));
         };

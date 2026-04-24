@@ -754,30 +754,31 @@ fn align_window(options: AlignWindowOptions, format: Format) -> Result<(), LogQu
         stream_data.insert(stream_id.clone(), stamped);
     }
 
-    let timeline = build_timeline(
-        &stream_data,
-        &stream_ids,
-        options.mode,
-        options.anchor_stream.as_deref(),
-        options.step_ns,
+    let timeline = build_timeline(TimelineRequest {
+        stream_data: &stream_data,
+        streams: &stream_ids,
+        mode: options.mode,
+        anchor_stream: options.anchor_stream.as_deref(),
+        step_ns: options.step_ns,
         start_ns,
         end_ns,
-        align_limit,
-    )?;
+        limit: align_limit,
+    })?;
+
+    let align_context = AlignBuildContext {
+        streams: &stream_ids,
+        stream_data: &stream_data,
+        fill_policy: options.fill_policy,
+        max_skew_ns: options.max_skew_ns,
+        require_all_streams: options.require_all_streams,
+        time_field: options.time_field,
+    };
 
     let mut emitted = 0usize;
     match options.emit {
         QueryEmitMode::Selectors => {
             for aligned_time_ns in timeline {
-                let row = build_align_selector_row(
-                    aligned_time_ns,
-                    &stream_ids,
-                    &stream_data,
-                    options.fill_policy,
-                    options.max_skew_ns,
-                    options.require_all_streams,
-                    options.time_field,
-                );
+                let row = build_align_selector_row(aligned_time_ns, &align_context);
                 if let Some(row) = row {
                     print_ndjson(&row)?;
                     emitted = emitted.saturating_add(1);
@@ -787,16 +788,8 @@ fn align_window(options: AlignWindowOptions, format: Format) -> Result<(), LogQu
         }
         QueryEmitMode::Aligned => {
             for aligned_time_ns in timeline {
-                let row = build_aligned_row(
-                    aligned_time_ns,
-                    &stream_ids,
-                    &stream_data,
-                    options.fill_policy,
-                    options.max_skew_ns,
-                    options.require_all_streams,
-                    options.time_field,
-                    options.include_provenance,
-                );
+                let row =
+                    build_aligned_row(aligned_time_ns, &align_context, options.include_provenance);
                 if let Some(row) = row {
                     print_ndjson(&row)?;
                     emitted = emitted.saturating_add(1);
@@ -806,16 +799,7 @@ fn align_window(options: AlignWindowOptions, format: Format) -> Result<(), LogQu
         }
         QueryEmitMode::Summary => {
             for aligned_time_ns in timeline {
-                let row = build_aligned_row(
-                    aligned_time_ns,
-                    &stream_ids,
-                    &stream_data,
-                    options.fill_policy,
-                    options.max_skew_ns,
-                    options.require_all_streams,
-                    options.time_field,
-                    false,
-                );
+                let row = build_aligned_row(aligned_time_ns, &align_context, false);
                 if row.is_some() {
                     emitted = emitted.saturating_add(1);
                 }
@@ -927,42 +911,53 @@ fn normalize_streams(streams: &[String]) -> Result<Vec<String>, LogQueryCommandE
     Ok(result)
 }
 
-fn build_timeline(
-    stream_data: &BTreeMap<String, Vec<StampedRecord>>,
-    streams: &[String],
+struct TimelineRequest<'a> {
+    stream_data: &'a BTreeMap<String, Vec<StampedRecord>>,
+    streams: &'a [String],
     mode: AlignMode,
-    anchor_stream: Option<&str>,
+    anchor_stream: Option<&'a str>,
     step_ns: Option<u64>,
     start_ns: u64,
     end_ns: u64,
     limit: usize,
-) -> Result<Vec<u64>, LogQueryCommandError> {
-    match mode {
+}
+
+struct AlignBuildContext<'a> {
+    streams: &'a [String],
+    stream_data: &'a BTreeMap<String, Vec<StampedRecord>>,
+    fill_policy: FillPolicy,
+    max_skew_ns: u64,
+    require_all_streams: bool,
+    time_field: TimeField,
+}
+
+fn build_timeline(request: TimelineRequest<'_>) -> Result<Vec<u64>, LogQueryCommandError> {
+    match request.mode {
         AlignMode::Anchor => {
-            let anchor = anchor_stream.ok_or_else(|| {
+            let anchor = request.anchor_stream.ok_or_else(|| {
                 LogQueryCommandError::InvalidInput(
                     "--anchor-stream is required with --mode anchor".to_string(),
                 )
             })?;
-            if !streams.iter().any(|value| value == anchor) {
+            if !request.streams.iter().any(|value| value == anchor) {
                 return Err(LogQueryCommandError::InvalidInput(
                     "--anchor-stream must be part of --streams".to_string(),
                 ));
             }
-            let anchor_rows = stream_data.get(anchor).ok_or_else(|| {
+            let anchor_rows = request.stream_data.get(anchor).ok_or_else(|| {
                 LogQueryCommandError::InvalidInput("anchor stream has no indexed data".to_string())
             })?;
-            if anchor_rows.len() > limit {
+            if anchor_rows.len() > request.limit {
                 return Err(LogQueryCommandError::InvalidInput(format!(
                     "aligned row cap exceeded ({} > {})",
                     anchor_rows.len(),
-                    limit
+                    request.limit
                 )));
             }
             Ok(anchor_rows.iter().map(|value| value.ts).collect())
         }
         AlignMode::Grid => {
-            let step = step_ns.ok_or_else(|| {
+            let step = request.step_ns.ok_or_else(|| {
                 LogQueryCommandError::InvalidInput(
                     "--step-ns is required with --mode grid".to_string(),
                 )
@@ -974,22 +969,23 @@ fn build_timeline(
             }
 
             let mut timeline = Vec::new();
-            let mut cursor = start_ns;
+            let mut cursor = request.start_ns;
             loop {
-                if timeline.len() >= limit {
+                if timeline.len() >= request.limit {
                     return Err(LogQueryCommandError::InvalidInput(format!(
-                        "aligned row cap exceeded (>{limit})"
+                        "aligned row cap exceeded (>{})",
+                        request.limit
                     )));
                 }
                 timeline.push(cursor);
-                if cursor >= end_ns {
+                if cursor >= request.end_ns {
                     break;
                 }
                 let next = cursor.saturating_add(step);
                 if next <= cursor {
                     break;
                 }
-                cursor = next.min(end_ns);
+                cursor = next.min(request.end_ns);
             }
             Ok(timeline)
         }
@@ -998,12 +994,7 @@ fn build_timeline(
 
 fn build_align_selector_row(
     aligned_time_ns: u64,
-    streams: &[String],
-    stream_data: &BTreeMap<String, Vec<StampedRecord>>,
-    fill_policy: FillPolicy,
-    max_skew_ns: u64,
-    require_all_streams: bool,
-    time_field: TimeField,
+    context: &AlignBuildContext<'_>,
 ) -> Option<AlignSelectorRow> {
     let mut row = AlignSelectorRow {
         aligned_time_ns,
@@ -1011,12 +1002,18 @@ fn build_align_selector_row(
     };
 
     let mut missing = false;
-    for stream in streams {
-        let records = stream_data
+    for stream in context.streams {
+        let records = context
+            .stream_data
             .get(stream)
             .map(|value| value.as_slice())
             .unwrap_or(&[]);
-        let matched = find_match(records, aligned_time_ns, fill_policy, max_skew_ns);
+        let matched = find_match(
+            records,
+            aligned_time_ns,
+            context.fill_policy,
+            context.max_skew_ns,
+        );
         if matches!(matched.status, MatchStatus::Missing) {
             missing = true;
             row.streams.insert(stream.clone(), None);
@@ -1028,29 +1025,21 @@ fn build_align_selector_row(
         }
     }
 
-    if require_all_streams || fill_policy == FillPolicy::Drop {
-        if missing {
-            return None;
-        }
+    if (context.require_all_streams || context.fill_policy == FillPolicy::Drop) && missing {
+        return None;
     }
 
-    let _ = time_field;
     Some(row)
 }
 
 fn build_aligned_row(
     aligned_time_ns: u64,
-    streams: &[String],
-    stream_data: &BTreeMap<String, Vec<StampedRecord>>,
-    fill_policy: FillPolicy,
-    max_skew_ns: u64,
-    require_all_streams: bool,
-    time_field: TimeField,
+    context: &AlignBuildContext<'_>,
     include_provenance: bool,
 ) -> Option<AlignedRowPayload> {
     let mut row = AlignedRowPayload {
         aligned_time_ns,
-        time_field: match time_field {
+        time_field: match context.time_field {
             TimeField::Event => "event",
             TimeField::Commit => "commit",
         },
@@ -1058,12 +1047,18 @@ fn build_aligned_row(
     };
 
     let mut missing = false;
-    for stream in streams {
-        let records = stream_data
+    for stream in context.streams {
+        let records = context
+            .stream_data
             .get(stream)
             .map(|value| value.as_slice())
             .unwrap_or(&[]);
-        let matched = find_match(records, aligned_time_ns, fill_policy, max_skew_ns);
+        let matched = find_match(
+            records,
+            aligned_time_ns,
+            context.fill_policy,
+            context.max_skew_ns,
+        );
         let payload = match matched.status {
             MatchStatus::Exact | MatchStatus::Nearest => {
                 let record = matched
@@ -1114,10 +1109,8 @@ fn build_aligned_row(
         row.streams.insert(stream.clone(), payload);
     }
 
-    if require_all_streams || fill_policy == FillPolicy::Drop {
-        if missing {
-            return None;
-        }
+    if (context.require_all_streams || context.fill_policy == FillPolicy::Drop) && missing {
+        return None;
     }
 
     Some(row)

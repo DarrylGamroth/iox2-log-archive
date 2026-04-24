@@ -260,6 +260,7 @@ impl ArchiveReplayer {
     }
 
     /// Reads next record from cursor and advances it.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<ReplayedFrame>, ArchiveReplayError> {
         if self.cursor >= self.ordered_sequences.len() {
             return Ok(None);

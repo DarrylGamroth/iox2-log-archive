@@ -35,6 +35,9 @@ struct LogRecordInput<'a> {
     payload: &'a [u8],
 }
 
+type ReplayedRecord = (u64, Vec<u8>, Vec<u8>);
+type RecordAndReplayResult = (EffectiveAsyncIoBackend, Vec<ReplayedRecord>);
+
 trait LegacyLogAppendExt {
     fn append_log_record(
         &mut self,
@@ -75,7 +78,7 @@ fn record_and_replay(
     backend: AsyncIoBackend,
     records: u64,
     payload_len: usize,
-) -> (EffectiveAsyncIoBackend, Vec<(u64, Vec<u8>, Vec<u8>)>) {
+) -> RecordAndReplayResult {
     let mut recorder = ArchiveRecorderBuilder::new(storage_path)
         .metadata_log_path(metadata_path)
         .profile(RecorderProfile::Throughput)
