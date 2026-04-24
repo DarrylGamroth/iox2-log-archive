@@ -17,6 +17,7 @@
 //! iceoryx2 publish-subscribe services.
 
 mod control;
+mod dynamic_type;
 mod record;
 mod rematerialize;
 

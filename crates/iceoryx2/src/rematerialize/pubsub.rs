@@ -16,11 +16,13 @@ use core::ptr::copy_nonoverlapping;
 use iceoryx2::port::publisher::Publisher;
 use iceoryx2::prelude::*;
 use iceoryx2::service::builder::{CustomHeaderMarker, CustomPayloadMarker};
-use iceoryx2::service::static_config::message_type_details::{TypeDetail, TypeName, TypeVariant};
+use iceoryx2::service::static_config::message_type_details::TypeVariant;
 use iox2_log_archive_core::log_archive::{
     ArchiveLocator, ArchiveReplayer, ArchiveSourcePattern, ReplayedFrame,
     decode_adapter_user_header,
 };
+
+use crate::dynamic_type::type_detail_with_layout;
 
 use super::{ArchiveRematerializeError, DEFAULT_PUBSUB_REMATERIALIZER_NODE_NAME};
 
@@ -137,23 +139,16 @@ impl PubSubRematerializerBuilder {
         let service_name = ServiceName::new(&self.service_name)
             .map_err(|error| ArchiveRematerializeError::InvalidServiceName(format!("{error:?}")))?;
 
-        let payload_type_name = TypeName::from_str_truncated(&self.payload_type_name)
-            .map_err(|error| ArchiveRematerializeError::InvalidTypeName(format!("{error:?}")))?;
-        let user_header_type_name = TypeName::from_str_truncated(&self.user_header_type_name)
-            .map_err(|error| ArchiveRematerializeError::InvalidTypeName(format!("{error:?}")))?;
-
-        let mut payload_type = TypeDetail::new::<()>(TypeVariant::Dynamic);
-        iceoryx2::testing::type_detail_set_size(&mut payload_type, 1);
-        iceoryx2::testing::type_detail_set_alignment(&mut payload_type, 1);
-        iceoryx2::testing::type_detail_set_name(&mut payload_type, payload_type_name);
-
-        let mut user_header_type = TypeDetail::new::<()>(TypeVariant::FixedSize);
-        iceoryx2::testing::type_detail_set_size(&mut user_header_type, self.user_header_size);
-        iceoryx2::testing::type_detail_set_alignment(
-            &mut user_header_type,
+        let payload_type =
+            type_detail_with_layout(&self.payload_type_name, TypeVariant::Dynamic, 1, 1)
+                .map_err(ArchiveRematerializeError::InvalidTypeName)?;
+        let user_header_type = type_detail_with_layout(
+            &self.user_header_type_name,
+            TypeVariant::FixedSize,
+            self.user_header_size,
             self.user_header_alignment,
-        );
-        iceoryx2::testing::type_detail_set_name(&mut user_header_type, user_header_type_name);
+        )
+        .map_err(ArchiveRematerializeError::InvalidTypeName)?;
 
         let service = unsafe {
             node.service_builder(&service_name)

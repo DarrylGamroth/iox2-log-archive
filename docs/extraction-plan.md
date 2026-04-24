@@ -16,7 +16,7 @@
 ## Remaining Decoupling Work
 
 - Replace the pinned upstream git dependency with the selected released crate version.
-- Audit direct use of dynamic type-detail internals and either avoid them or upstream a small stable API hook.
+- Track the dynamic type-detail API gap in `docs/iceoryx2-api-audit.md` and replace it once upstream exposes a stable hook.
 - Update `iox2-log-archive-orchestrator` release packaging to consume these external binaries.
 
 ## Verification
