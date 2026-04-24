@@ -16,6 +16,8 @@
 //! the public integration point for rematerializing archived records back into
 //! iceoryx2 publish-subscribe services.
 
+mod control;
 mod rematerialize;
 
+pub use control::*;
 pub use rematerialize::*;
