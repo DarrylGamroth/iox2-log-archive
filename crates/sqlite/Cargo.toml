@@ -1,0 +1,18 @@
+[package]
+name = "iox2-log-archive-sqlite"
+description = "SQLite metadata index/query backend for iox2-log-archive"
+categories = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[dependencies]
+iox2-log-archive-core = { workspace = true, features = ["std"] }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

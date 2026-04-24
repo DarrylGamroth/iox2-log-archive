@@ -1,0 +1,51 @@
+[package]
+name = "iox2-log-archive-cli"
+description = "CLI tools for iox2-log-archive"
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[lib]
+name = "iox2_log_archive_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "iox2-log-recorder"
+path = "src/iox2-log-recorder/src/main.rs"
+
+[[bin]]
+name = "iox2-log-control"
+path = "src/iox2-log-control/src/main.rs"
+
+[[bin]]
+name = "iox2-log-admin"
+path = "src/iox2-log-admin/src/main.rs"
+
+[[bin]]
+name = "iox2-log-query"
+path = "src/iox2-log-query/src/main.rs"
+
+[[bin]]
+name = "iox2-log-replay"
+path = "src/iox2-log-replay/src/main.rs"
+
+[dependencies]
+iox2-log-archive-core = { workspace = true, features = ["std"] }
+iox2-log-archive-iceoryx2 = { workspace = true }
+iox2-log-archive-sqlite = { workspace = true }
+iceoryx2 = { workspace = true, features = ["std"] }
+iceoryx2-log = { workspace = true, features = ["std"] }
+
+anyhow = { workspace = true }
+better-panic = { workspace = true }
+clap = { workspace = true }
+colored = { workspace = true }
+human-panic = { workspace = true }
+ron = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
+serde_yaml = { workspace = true }
+time = { workspace = true }
+toml = { workspace = true }

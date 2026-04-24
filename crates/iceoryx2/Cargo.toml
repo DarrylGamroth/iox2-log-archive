@@ -1,0 +1,15 @@
+[package]
+name = "iox2-log-archive-iceoryx2"
+description = "iceoryx2 adapter crate for iox2-log-archive"
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[dependencies]
+iox2-log-archive-core = { workspace = true, features = ["std"] }
+iceoryx2 = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

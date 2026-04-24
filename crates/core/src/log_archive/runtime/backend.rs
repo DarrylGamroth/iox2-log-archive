@@ -1,0 +1,502 @@
+// Copyright (c) 2026 Contributors to the Eclipse Foundation
+//
+// See the NOTICE file(s) distributed with this work for additional
+// information regarding copyright ownership.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Apache Software License 2.0 which is available at
+// https://www.apache.org/licenses/LICENSE-2.0, or the MIT license
+// which is available at https://opensource.org/licenses/MIT.
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Error, ErrorKind, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
+
+use super::common::{ArchiveRecorderError, AsyncIoBackend, EffectiveAsyncIoBackend};
+
+#[derive(Debug)]
+pub(super) struct BlockingIoBackend;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PendingWrite {
+    fd: RawFd,
+    offset: u64,
+    written: usize,
+    buffer: Box<[u8]>,
+    operation: &'static str,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct IoUringBackend {
+    ring: io_uring::IoUring,
+    queue_depth: u32,
+    submit_batch_max: u32,
+    cqe_batch_max: u32,
+    register_files_requested: bool,
+    registered_file_slots: BTreeMap<RawFd, u32>,
+    pending_writes: BTreeMap<u64, PendingWrite>,
+    pending_submit_count: u32,
+    next_user_data: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl core::fmt::Debug for IoUringBackend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IoUringBackend")
+            .field("queue_depth", &self.queue_depth)
+            .field("submit_batch_max", &self.submit_batch_max)
+            .field("cqe_batch_max", &self.cqe_batch_max)
+            .field("register_files_requested", &self.register_files_requested)
+            .field("registered_file_slots", &self.registered_file_slots)
+            .field("pending_writes", &self.pending_writes.len())
+            .field("pending_submit_count", &self.pending_submit_count)
+            .finish()
+    }
+}
+
+/// Unified recorder I/O backend abstraction.
+#[derive(Debug)]
+pub(super) enum RecorderIoBackend {
+    Blocking(BlockingIoBackend),
+    #[cfg(target_os = "linux")]
+    IoUring(IoUringBackend),
+}
+
+impl RecorderIoBackend {
+    pub(super) fn create(
+        requested: AsyncIoBackend,
+        io_uring_queue_depth: u32,
+        io_submit_batch_max: u32,
+        io_cqe_batch_max: u32,
+        io_uring_register_files: bool,
+    ) -> Result<(Self, EffectiveAsyncIoBackend), ArchiveRecorderError> {
+        match requested {
+            AsyncIoBackend::Blocking => Ok((
+                Self::Blocking(BlockingIoBackend),
+                EffectiveAsyncIoBackend::Blocking,
+            )),
+            AsyncIoBackend::IoUringPreferred => {
+                #[cfg(target_os = "linux")]
+                {
+                    if let Ok(backend) = IoUringBackend::new(
+                        io_uring_queue_depth,
+                        io_submit_batch_max,
+                        io_cqe_batch_max,
+                        io_uring_register_files,
+                    ) {
+                        return Ok((Self::IoUring(backend), EffectiveAsyncIoBackend::IoUring));
+                    }
+                }
+
+                Ok((
+                    Self::Blocking(BlockingIoBackend),
+                    EffectiveAsyncIoBackend::Blocking,
+                ))
+            }
+            AsyncIoBackend::IoUringRequired => {
+                #[cfg(target_os = "linux")]
+                {
+                    return IoUringBackend::new(
+                        io_uring_queue_depth,
+                        io_submit_batch_max,
+                        io_cqe_batch_max,
+                        io_uring_register_files,
+                    )
+                    .map(|backend| (Self::IoUring(backend), EffectiveAsyncIoBackend::IoUring))
+                    .map_err(|_| {
+                        ArchiveRecorderError::InvalidConfiguration(
+                            "io_uring backend required but unavailable",
+                        )
+                    });
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(ArchiveRecorderError::InvalidConfiguration(
+                        "io_uring backend required but unavailable",
+                    ));
+                }
+            }
+        }
+    }
+
+    pub(super) fn refresh_registered_files(
+        &mut self,
+        #[cfg(target_os = "linux")] fds: &[RawFd],
+        #[cfg(not(target_os = "linux"))] _fds: &[i32],
+    ) -> Result<(), ArchiveRecorderError> {
+        match self {
+            Self::Blocking(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(backend) => backend.refresh_registered_files(fds),
+        }
+    }
+
+    pub(super) fn flush_pending(&mut self) -> Result<(), ArchiveRecorderError> {
+        match self {
+            Self::Blocking(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(backend) => backend.flush_pending(),
+        }
+    }
+
+    pub(super) fn write_all_at(
+        &mut self,
+        file: &mut File,
+        path: &Path,
+        offset: u64,
+        bytes: &[u8],
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
+        match self {
+            Self::Blocking(_) => file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| file.write_all(bytes))
+                .map_err(|source| ArchiveRecorderError::Io {
+                    operation,
+                    path: path.to_path_buf(),
+                    source,
+                }),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(backend) => backend.enqueue_write(file, path, offset, bytes, operation),
+        }
+    }
+
+    pub(super) fn flush(
+        &mut self,
+        file: &mut File,
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
+        self.flush_pending()?;
+        file.flush().map_err(|source| ArchiveRecorderError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    pub(super) fn sync_data(
+        &mut self,
+        file: &mut File,
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
+        self.flush_pending()?;
+        match self {
+            Self::Blocking(_) => file.sync_data().map_err(|source| ArchiveRecorderError::Io {
+                operation,
+                path: path.to_path_buf(),
+                source,
+            }),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(backend) => backend.sync_data(file, path, operation),
+        }
+    }
+
+    pub(super) fn set_len(
+        &mut self,
+        file: &mut File,
+        path: &Path,
+        len: u64,
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
+        self.flush_pending()?;
+        file.set_len(len)
+            .map_err(|source| ArchiveRecorderError::Io {
+                operation,
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl IoUringBackend {
+    fn new(
+        queue_depth: u32,
+        submit_batch_max: u32,
+        cqe_batch_max: u32,
+        register_files_requested: bool,
+    ) -> std::io::Result<Self> {
+        let queue_depth = queue_depth.max(1);
+        let submit_batch_max = submit_batch_max.max(1).min(queue_depth);
+        let cqe_batch_max = cqe_batch_max.max(1).min(queue_depth.saturating_mul(2));
+
+        Ok(Self {
+            ring: io_uring::IoUring::new(queue_depth)?,
+            queue_depth,
+            submit_batch_max,
+            cqe_batch_max,
+            register_files_requested,
+            registered_file_slots: BTreeMap::new(),
+            pending_writes: BTreeMap::new(),
+            pending_submit_count: 0,
+            next_user_data: 1,
+        })
+    }
+
+    fn enqueue_write(
+        &mut self,
+        file: &File,
+        path: &Path,
+        offset: u64,
+        bytes: &[u8],
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let user_data = self.next_user_data;
+        self.next_user_data = self.next_user_data.wrapping_add(1);
+        let pending = PendingWrite {
+            fd: file.as_raw_fd(),
+            offset,
+            written: 0,
+            buffer: bytes.to_vec().into_boxed_slice(),
+            operation,
+            path: path.to_path_buf(),
+        };
+        self.pending_writes.insert(user_data, pending);
+        self.push_write_entry(user_data)?;
+
+        if self.pending_submit_count >= self.submit_batch_max {
+            self.submit_pending()?;
+        }
+
+        if self.pending_writes.len() >= self.queue_depth as usize {
+            self.submit_pending()?;
+            self.wait_for_and_reap(1)?;
+        } else {
+            self.reap_completed()?;
+        }
+
+        Ok(())
+    }
+
+    fn refresh_registered_files(&mut self, fds: &[RawFd]) -> Result<(), ArchiveRecorderError> {
+        if !self.register_files_requested {
+            self.registered_file_slots.clear();
+            return Ok(());
+        }
+
+        self.flush_pending()?;
+
+        let mut unique_fds = Vec::<RawFd>::new();
+        for fd in fds {
+            if !unique_fds.contains(&fd) {
+                unique_fds.push(*fd);
+            }
+        }
+
+        let submitter = self.ring.submitter();
+        if !self.registered_file_slots.is_empty() {
+            let _ = submitter.unregister_files();
+            self.registered_file_slots.clear();
+        }
+        if unique_fds.is_empty() {
+            return Ok(());
+        }
+
+        submitter
+            .register_files(&unique_fds)
+            .map_err(|source| ArchiveRecorderError::Io {
+                operation: "register io_uring files",
+                path: PathBuf::from("<io_uring>"),
+                source,
+            })?;
+        self.registered_file_slots = unique_fds
+            .into_iter()
+            .enumerate()
+            .map(|(index, fd)| (fd, index as u32))
+            .collect();
+
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> Result<(), ArchiveRecorderError> {
+        self.submit_pending()?;
+        while !self.pending_writes.is_empty() {
+            self.wait_for_and_reap(1)?;
+        }
+        Ok(())
+    }
+
+    fn sync_data(
+        &mut self,
+        file: &File,
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
+        self.flush_pending()?;
+        self.submit_pending()?;
+
+        let entry = if let Some(index) = self.registered_file_slots.get(&file.as_raw_fd()) {
+            io_uring::opcode::Fsync::new(io_uring::types::Fixed(*index))
+                .build()
+                .user_data(0xFFFF_FFFF_FFFF_FFFE)
+        } else {
+            io_uring::opcode::Fsync::new(io_uring::types::Fd(file.as_raw_fd()))
+                .build()
+                .user_data(0xFFFF_FFFF_FFFF_FFFE)
+        };
+        let result = unsafe { self.submit_direct_and_wait_one(entry) }.map_err(|source| {
+            ArchiveRecorderError::Io {
+                operation,
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        if result < 0 {
+            return Err(ArchiveRecorderError::Io {
+                operation,
+                path: path.to_path_buf(),
+                source: std::io::Error::from_raw_os_error(-result),
+            });
+        }
+        Ok(())
+    }
+
+    fn push_write_entry(&mut self, user_data: u64) -> Result<(), ArchiveRecorderError> {
+        loop {
+            let entry = self.build_write_entry(user_data)?;
+            let mut sq = self.ring.submission();
+            match unsafe { sq.push(&entry) } {
+                Ok(()) => {
+                    self.pending_submit_count += 1;
+                    return Ok(());
+                }
+                Err(_) => {
+                    drop(sq);
+                    self.submit_pending()?;
+                    self.wait_for_and_reap(1)?;
+                }
+            }
+        }
+    }
+
+    fn build_write_entry(
+        &self,
+        user_data: u64,
+    ) -> Result<io_uring::squeue::Entry, ArchiveRecorderError> {
+        let pending = self.pending_writes.get(&user_data).ok_or_else(|| {
+            ArchiveRecorderError::RecoveryInconsistent("missing io_uring pending write state")
+        })?;
+        let remaining = pending.buffer.len().checked_sub(pending.written).ok_or(
+            ArchiveRecorderError::RecoveryInconsistent("io_uring pending write underflow"),
+        )?;
+        let ptr = pending.buffer[pending.written..].as_ptr();
+        let offset = pending.offset + pending.written as u64;
+        let entry = if let Some(index) = self.registered_file_slots.get(&pending.fd) {
+            io_uring::opcode::Write::new(io_uring::types::Fixed(*index), ptr, remaining as _)
+                .offset(offset)
+                .build()
+                .user_data(user_data)
+        } else {
+            io_uring::opcode::Write::new(io_uring::types::Fd(pending.fd), ptr, remaining as _)
+                .offset(offset)
+                .build()
+                .user_data(user_data)
+        };
+        Ok(entry)
+    }
+
+    fn submit_pending(&mut self) -> Result<(), ArchiveRecorderError> {
+        if self.pending_submit_count == 0 {
+            return Ok(());
+        }
+        self.ring
+            .submit()
+            .map_err(|source| ArchiveRecorderError::Io {
+                operation: "submit io_uring write batch",
+                path: PathBuf::from("<io_uring>"),
+                source,
+            })?;
+        self.pending_submit_count = 0;
+        Ok(())
+    }
+
+    fn wait_for_and_reap(&mut self, min_completions: usize) -> Result<(), ArchiveRecorderError> {
+        self.ring
+            .submit_and_wait(min_completions)
+            .map_err(|source| ArchiveRecorderError::Io {
+                operation: "wait for io_uring completion",
+                path: PathBuf::from("<io_uring>"),
+                source,
+            })?;
+        self.reap_completed()
+    }
+
+    fn reap_completed(&mut self) -> Result<(), ArchiveRecorderError> {
+        for _ in 0..self.cqe_batch_max {
+            let completion = {
+                let mut cq = self.ring.completion();
+                cq.next().map(|cqe| (cqe.user_data(), cqe.result()))
+            };
+            let Some((user_data, result)) = completion else {
+                break;
+            };
+
+            let mut pending = self.pending_writes.remove(&user_data).ok_or(
+                ArchiveRecorderError::RecoveryInconsistent("missing io_uring completion state"),
+            )?;
+            if result < 0 {
+                return Err(ArchiveRecorderError::Io {
+                    operation: pending.operation,
+                    path: pending.path,
+                    source: std::io::Error::from_raw_os_error(-result),
+                });
+            }
+            if result == 0 {
+                return Err(ArchiveRecorderError::Io {
+                    operation: pending.operation,
+                    path: pending.path,
+                    source: Error::new(ErrorKind::WriteZero, "io_uring write returned zero bytes"),
+                });
+            }
+
+            pending.written += result as usize;
+            if pending.written < pending.buffer.len() {
+                self.pending_writes.insert(user_data, pending);
+                self.push_write_entry(user_data)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    unsafe fn submit_direct_and_wait_one(
+        &mut self,
+        entry: io_uring::squeue::Entry,
+    ) -> std::io::Result<i32> {
+        loop {
+            let mut sq = self.ring.submission();
+            // SAFETY: The entry owns its buffer/file descriptor metadata for this
+            // synchronous direct operation and is not reused until the CQE is read.
+            match unsafe { sq.push(&entry) } {
+                Ok(()) => break,
+                Err(_) => {
+                    drop(sq);
+                    self.ring.submit()?;
+                }
+            }
+        }
+        self.ring.submit_and_wait(1)?;
+        let mut cq = self.ring.completion();
+        let Some(cqe) = cq.next() else {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "io_uring direct operation returned without completion",
+            ));
+        };
+        Ok(cqe.result())
+    }
+}

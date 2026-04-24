@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/iceoryx2",
+    "crates/sqlite",
+    "crates/cli",
+]
+
+[workspace.package]
+categories = ["database", "filesystem"]
+edition = "2024"
+homepage = "https://github.com/DarrylGamroth/iox2-log-archive"
+keywords = ["iceoryx2", "recorder", "replay", "logging"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DarrylGamroth/iox2-log-archive"
+rust-version = "1.85"
+version = "0.1.0"
+
+[workspace.dependencies]
+iox2-log-archive-core = { path = "crates/core", default-features = false }
+iox2-log-archive-iceoryx2 = { path = "crates/iceoryx2" }
+iox2-log-archive-sqlite = { path = "crates/sqlite" }
+
+# During extraction this points at the adjacent upstream checkout. Replace this
+# with a crates.io version or git tag once the target iceoryx2 release is fixed.
+iceoryx2 = { path = "../iceoryx2/iceoryx2", default-features = false }
+iceoryx2-bb-testing = { path = "../iceoryx2/iceoryx2-bb/testing" }
+iceoryx2-log = { path = "../iceoryx2/iceoryx2-log/log" }
+
+anyhow = "1.0.86"
+better-panic = "0.3.0"
+clap = { version = "4.5.4", features = ["derive"] }
+colored = "2.1"
+crc32c = "0.6.8"
+human-panic = "=2.0.2"
+ron = "0.11.0"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.203", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+serde_yaml = "0.9.34"
+tempfile = "3.12.0"
+time = { version = "0.3.37", features = ["parsing"] }
+toml = { version = "0.9.8", default-features = false, features = ["serde", "parse", "display"] }
