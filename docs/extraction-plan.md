@@ -3,8 +3,8 @@
 ## Status
 
 - Implemented as standalone workspace.
-- Current dependency baseline: adjacent `../iceoryx2/iceoryx2` path dependency.
-- Next dependency target: released `iceoryx2` crate or pinned upstream git tag.
+- Current dependency baseline: upstream `eclipse-iceoryx/iceoryx2` pinned to `3107941ba2a40f2897c395289447d0f93664ad8c`.
+- Next dependency target: released `iceoryx2` crate version.
 
 ## Workspace Shape
 
@@ -15,7 +15,7 @@
 
 ## Remaining Decoupling Work
 
-- Replace the path dependency on `../iceoryx2/iceoryx2` with the selected stable upstream dependency.
+- Replace the pinned upstream git dependency with the selected released crate version.
 - Audit direct use of dynamic type-detail internals and either avoid them or upstream a small stable API hook.
 - Update `iox2-log-archive-orchestrator` release packaging to consume these external binaries.
 

@@ -20,6 +20,6 @@ the public `iceoryx2` API.
 cargo check --workspace
 ```
 
-The extraction currently uses a path dependency on `../iceoryx2/iceoryx2`.
-Replace that dependency with a released crate or pinned upstream git revision
-when the supported iceoryx2 baseline is selected.
+The extraction currently pins `iceoryx2` to upstream commit
+`3107941ba2a40f2897c395289447d0f93664ad8c`. Replace that dependency with a
+released crate version when the required public APIs are available in a release.

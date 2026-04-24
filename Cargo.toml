@@ -22,11 +22,11 @@ iox2-log-archive-core = { path = "crates/core", default-features = false }
 iox2-log-archive-iceoryx2 = { path = "crates/iceoryx2" }
 iox2-log-archive-sqlite = { path = "crates/sqlite" }
 
-# During extraction this points at the adjacent upstream checkout. Replace this
-# with a crates.io version or git tag once the target iceoryx2 release is fixed.
-iceoryx2 = { path = "../iceoryx2/iceoryx2", default-features = false }
-iceoryx2-bb-testing = { path = "../iceoryx2/iceoryx2-bb/testing" }
-iceoryx2-log = { path = "../iceoryx2/iceoryx2-log/log" }
+# Pinned to upstream iceoryx2 main while the recorder API surface is validated.
+# Move to a released crate version once the required public APIs are available.
+iceoryx2 = { git = "https://github.com/eclipse-iceoryx/iceoryx2", rev = "3107941ba2a40f2897c395289447d0f93664ad8c", default-features = false }
+iceoryx2-bb-testing = { git = "https://github.com/eclipse-iceoryx/iceoryx2", rev = "3107941ba2a40f2897c395289447d0f93664ad8c" }
+iceoryx2-log = { git = "https://github.com/eclipse-iceoryx/iceoryx2", rev = "3107941ba2a40f2897c395289447d0f93664ad8c" }
 
 anyhow = "1.0.86"
 better-panic = "0.3.0"
