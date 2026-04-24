@@ -815,7 +815,6 @@ dependencies = [
  "clap",
  "colored",
  "human-panic",
- "iceoryx2",
  "iceoryx2-log",
  "iox2-log-archive-core",
  "iox2-log-archive-iceoryx2",
