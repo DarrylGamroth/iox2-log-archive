@@ -13,6 +13,10 @@
 //! Publish-subscribe recording adapter for iceoryx2.
 
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iceoryx2::prelude::*;
@@ -20,10 +24,10 @@ use iceoryx2::sample::Sample as PubSubSample;
 use iceoryx2::service::builder::{CustomHeaderMarker, CustomPayloadMarker};
 use iceoryx2::service::static_config::message_type_details::TypeDetail;
 use iox2_log_archive_core::log_archive::{
-    ArchiveRecorder, ArchiveRecorderBuilder, ArchiveRecorderError, AsyncIoBackend,
+    ArchiveRecorder, ArchiveRecorderBuilder, ArchiveRecorderError, AsyncIoBackend, ChecksumMode,
     DEFAULT_WAIT_DURABLE_DATA_AND_COMMIT_LOG_TIMEOUT, DEFAULT_WAIT_DURABLE_DATA_TIMEOUT,
-    EffectiveAsyncIoBackend, PersistenceMode, PublishSubscribeRecordInput, RecorderAckLevel,
-    RecorderProfile,
+    EffectiveAsyncIoBackend, OutOfSpacePolicy, PersistenceMode, PublishSubscribeRecordInput,
+    RecorderAckLevel, RecorderProfile,
 };
 
 use crate::{
@@ -59,6 +63,24 @@ pub struct PubSubRecorderConfig {
     pub segment_preallocate: bool,
     /// Optional max on-disk archive bytes.
     pub max_disk_bytes: Option<u64>,
+    /// Optional async data-path backend override.
+    pub async_io_backend: Option<AsyncIoBackend>,
+    /// Optional `io_uring` queue-depth override.
+    pub io_uring_queue_depth: Option<u32>,
+    /// Optional `io_uring` submit batch override.
+    pub io_submit_batch_max: Option<u32>,
+    /// Optional `io_uring` completion batch override.
+    pub io_cqe_batch_max: Option<u32>,
+    /// Optional `io_uring` registered-file mode override.
+    pub io_uring_register_files: Option<bool>,
+    /// Optional frame checksum mode override.
+    pub checksum_mode: Option<ChecksumMode>,
+    /// Optional out-of-space policy override.
+    pub out_of_space_policy: Option<OutOfSpacePolicy>,
+    /// Optional active metadata-log roll threshold override.
+    pub metadata_log_roll_bytes: Option<u64>,
+    /// Optional global metadata-log size-cap override.
+    pub metadata_log_max_bytes: Option<u64>,
     /// Optional stable source service identity override.
     pub source_service_id: Option<u64>,
     /// Wait interval when no data is available.
@@ -71,6 +93,23 @@ pub struct PubSubRecorderConfig {
     pub flush_interval: Option<Duration>,
     /// Optional per-record ack level.
     pub ack_level: Option<RecorderAckLevel>,
+    /// Optional cooperative shutdown flag for signal handlers or embedders.
+    pub shutdown_requested: Option<Arc<AtomicBool>>,
+}
+
+/// Reason a recorder run stopped.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PubSubRecorderStopReason {
+    /// A control-plane stop command was received.
+    ControlStop,
+    /// The cooperative shutdown flag was set.
+    ShutdownRequested,
+    /// Configured max-message bound was reached.
+    MaxMessages,
+    /// Configured wall-clock timeout was reached.
+    Timeout,
+    /// The iceoryx2 node wait operation was interrupted.
+    WaitInterrupted,
 }
 
 /// Summary returned after a recorder run completes.
@@ -88,8 +127,26 @@ pub struct PubSubRecorderSummary {
     pub default_ack_level: RecorderAckLevel,
     /// Requested ack level.
     pub requested_ack_level: Option<RecorderAckLevel>,
+    /// Stop reason.
+    pub stop_reason: PubSubRecorderStopReason,
     /// Source service id.
     pub source_service_id: u64,
+    /// Configured `io_uring` queue depth.
+    pub io_uring_queue_depth: u32,
+    /// Configured `io_uring` submit batch size.
+    pub io_submit_batch_max: u32,
+    /// Configured `io_uring` completion batch size.
+    pub io_cqe_batch_max: u32,
+    /// Configured `io_uring` registered-file mode.
+    pub io_uring_register_files: bool,
+    /// Configured frame checksum mode.
+    pub checksum_mode: ChecksumMode,
+    /// Configured out-of-space policy.
+    pub out_of_space_policy: OutOfSpacePolicy,
+    /// Configured metadata-log roll threshold.
+    pub metadata_log_roll_bytes: u64,
+    /// Configured metadata-log size cap.
+    pub metadata_log_max_bytes: u64,
     /// Flush interval.
     pub flush_interval: Option<Duration>,
     /// Max messages.
@@ -106,6 +163,20 @@ pub struct PubSubRecorderSummary {
     pub committed_records: u64,
     /// Payload bytes committed.
     pub payload_bytes_committed: u64,
+    /// Data bytes written.
+    pub data_bytes_written: u64,
+    /// Metadata bytes written.
+    pub metadata_bytes_written: u64,
+    /// Segment roll count.
+    pub rolled_segments: u64,
+    /// Preallocated segment count.
+    pub preallocated_segments: u64,
+    /// Out-of-space event count.
+    pub out_of_space_events: u64,
+    /// Metadata-log roll count.
+    pub metadata_log_rolls: u64,
+    /// Write amplification ratio.
+    pub write_amplification_ratio: f64,
     /// Last durable data sequence.
     pub last_durable_data_sequence: Option<u64>,
     /// Last durable commit ordinal.
@@ -210,79 +281,88 @@ pub fn record_publish_subscribe(
     let mut is_paused = false;
     let mut paused_since_ns = None;
     let mut stop_requested = false;
+    let mut stop_reason = None;
 
-    let poll_control_requests = |recorder: &mut ArchiveRecorder,
-                                 is_paused: &mut bool,
-                                 paused_since_ns: &mut Option<u64>,
-                                 dropped_while_paused: &mut u64,
-                                 stop_requested: &mut bool| {
-        while let Some(active_request) = control_server.receive().map_err(to_iox2_error)? {
-            let request = *active_request;
-            let response = if request.protocol_version != LOG_RECORDER_CONTROL_PROTOCOL_VERSION {
-                LogRecorderControlResponse::error(LOG_RECORDER_CONTROL_STATUS_INVALID_REQUEST)
-            } else {
-                match request.command {
-                    LOG_RECORDER_CONTROL_CMD_STATUS => control_response_for_recorder(
-                        recorder,
-                        *is_paused,
-                        *paused_since_ns,
-                        *dropped_while_paused,
-                    ),
-                    LOG_RECORDER_CONTROL_CMD_FLUSH => match recorder.flush() {
-                        Ok(()) => control_response_for_recorder(
+    let mut poll_control_requests =
+        |recorder: &mut ArchiveRecorder,
+         is_paused: &mut bool,
+         paused_since_ns: &mut Option<u64>,
+         dropped_while_paused: &mut u64,
+         stop_requested: &mut bool| {
+            while let Some(active_request) = control_server.receive().map_err(to_iox2_error)? {
+                let request = *active_request;
+                let response = if request.protocol_version != LOG_RECORDER_CONTROL_PROTOCOL_VERSION
+                {
+                    LogRecorderControlResponse::error(LOG_RECORDER_CONTROL_STATUS_INVALID_REQUEST)
+                } else {
+                    match request.command {
+                        LOG_RECORDER_CONTROL_CMD_STATUS => control_response_for_recorder(
                             recorder,
                             *is_paused,
                             *paused_since_ns,
                             *dropped_while_paused,
                         ),
-                        Err(_) => LogRecorderControlResponse::error(
-                            LOG_RECORDER_CONTROL_STATUS_INTERNAL_ERROR,
-                        ),
-                    },
-                    LOG_RECORDER_CONTROL_CMD_PAUSE => {
-                        if !*is_paused {
-                            *is_paused = true;
-                            *paused_since_ns = Some(unix_time_now_ns());
+                        LOG_RECORDER_CONTROL_CMD_FLUSH => match recorder.flush() {
+                            Ok(()) => control_response_for_recorder(
+                                recorder,
+                                *is_paused,
+                                *paused_since_ns,
+                                *dropped_while_paused,
+                            ),
+                            Err(_) => LogRecorderControlResponse::error(
+                                LOG_RECORDER_CONTROL_STATUS_INTERNAL_ERROR,
+                            ),
+                        },
+                        LOG_RECORDER_CONTROL_CMD_PAUSE => {
+                            if !*is_paused {
+                                *is_paused = true;
+                                *paused_since_ns = Some(unix_time_now_ns());
+                            }
+                            control_response_for_recorder(
+                                recorder,
+                                *is_paused,
+                                *paused_since_ns,
+                                *dropped_while_paused,
+                            )
                         }
-                        control_response_for_recorder(
-                            recorder,
-                            *is_paused,
-                            *paused_since_ns,
-                            *dropped_while_paused,
-                        )
+                        LOG_RECORDER_CONTROL_CMD_RESUME => {
+                            *is_paused = false;
+                            *paused_since_ns = None;
+                            control_response_for_recorder(
+                                recorder,
+                                *is_paused,
+                                *paused_since_ns,
+                                *dropped_while_paused,
+                            )
+                        }
+                        LOG_RECORDER_CONTROL_CMD_STOP => {
+                            *stop_requested = true;
+                            stop_reason = Some(PubSubRecorderStopReason::ControlStop);
+                            control_response_for_recorder(
+                                recorder,
+                                *is_paused,
+                                *paused_since_ns,
+                                *dropped_while_paused,
+                            )
+                        }
+                        _ => LogRecorderControlResponse::error(
+                            LOG_RECORDER_CONTROL_STATUS_INVALID_REQUEST,
+                        ),
                     }
-                    LOG_RECORDER_CONTROL_CMD_RESUME => {
-                        *is_paused = false;
-                        *paused_since_ns = None;
-                        control_response_for_recorder(
-                            recorder,
-                            *is_paused,
-                            *paused_since_ns,
-                            *dropped_while_paused,
-                        )
-                    }
-                    LOG_RECORDER_CONTROL_CMD_STOP => {
-                        *stop_requested = true;
-                        control_response_for_recorder(
-                            recorder,
-                            *is_paused,
-                            *paused_since_ns,
-                            *dropped_while_paused,
-                        )
-                    }
-                    _ => LogRecorderControlResponse::error(
-                        LOG_RECORDER_CONTROL_STATUS_INVALID_REQUEST,
-                    ),
-                }
-            };
+                };
 
-            let _ = active_request.send_copy(response);
-        }
+                let _ = active_request.send_copy(response);
+            }
 
-        Ok::<(), PubSubRecorderError>(())
-    };
+            Ok::<(), PubSubRecorderError>(())
+        };
 
     'record_loop: loop {
+        if shutdown_requested(&config) {
+            stop_reason = Some(PubSubRecorderStopReason::ShutdownRequested);
+            break;
+        }
+
         poll_control_requests(
             &mut recorder,
             &mut is_paused,
@@ -297,6 +377,11 @@ pub fn record_publish_subscribe(
         while let Some(sample) =
             unsafe { subscriber.receive_custom_payload() }.map_err(to_iox2_error)?
         {
+            if shutdown_requested(&config) {
+                stop_reason = Some(PubSubRecorderStopReason::ShutdownRequested);
+                break 'record_loop;
+            }
+
             let (user_header, payload) =
                 extract_pubsub_payload(&sample, &service_types.user_header);
 
@@ -336,12 +421,13 @@ pub fn record_publish_subscribe(
                 break 'record_loop;
             }
 
-            if should_stop(
+            if let Some(reason) = bounded_stop_reason(
                 messages_recorded,
                 config.max_messages,
                 start.elapsed(),
                 config.timeout,
             ) {
+                stop_reason = Some(reason);
                 break 'record_loop;
             }
 
@@ -353,12 +439,13 @@ pub fn record_publish_subscribe(
             }
         }
 
-        if should_stop(
+        if let Some(reason) = bounded_stop_reason(
             messages_recorded,
             config.max_messages,
             start.elapsed(),
             config.timeout,
         ) {
+            stop_reason = Some(reason);
             break;
         }
 
@@ -373,7 +460,13 @@ pub fn record_publish_subscribe(
             }
         }
 
+        if shutdown_requested(&config) {
+            stop_reason = Some(PubSubRecorderStopReason::ShutdownRequested);
+            break;
+        }
+
         if node.wait(config.cycle_time).is_err() {
+            stop_reason = Some(PubSubRecorderStopReason::WaitInterrupted);
             break;
         }
     }
@@ -388,7 +481,16 @@ pub fn record_publish_subscribe(
         effective_async_io_backend: recorder.effective_async_io_backend(),
         default_ack_level: recorder.default_ack_level(),
         requested_ack_level: config.ack_level,
+        stop_reason: stop_reason.unwrap_or(PubSubRecorderStopReason::ControlStop),
         source_service_id,
+        io_uring_queue_depth: recorder.io_uring_queue_depth(),
+        io_submit_batch_max: recorder.io_submit_batch_max(),
+        io_cqe_batch_max: recorder.io_cqe_batch_max(),
+        io_uring_register_files: recorder.io_uring_register_files(),
+        checksum_mode: recorder.checksum_mode(),
+        out_of_space_policy: recorder.out_of_space_policy(),
+        metadata_log_roll_bytes: recorder.metadata_log_roll_bytes(),
+        metadata_log_max_bytes: recorder.metadata_log_max_bytes(),
         flush_interval: config.flush_interval,
         max_messages: config.max_messages,
         timeout: config.timeout,
@@ -397,6 +499,13 @@ pub fn record_publish_subscribe(
         elapsed: start.elapsed(),
         committed_records: stats.committed_records,
         payload_bytes_committed: stats.payload_bytes_committed,
+        data_bytes_written: stats.data_bytes_written,
+        metadata_bytes_written: stats.metadata_bytes_written,
+        rolled_segments: stats.rolled_segments,
+        preallocated_segments: stats.preallocated_segments,
+        out_of_space_events: stats.out_of_space_events,
+        metadata_log_rolls: stats.metadata_log_rolls,
+        write_amplification_ratio: stats.amplification_ratio(),
         last_durable_data_sequence: recorder.last_durable_data_sequence(),
         last_durable_commit_ordinal: recorder.last_durable_commit_ordinal(),
         paused_at_shutdown: is_paused,
@@ -414,6 +523,33 @@ fn recorder_builder(config: &PubSubRecorderConfig) -> ArchiveRecorderBuilder {
         .spare_preallocated_segments(config.spare_preallocated_segments)
         .segment_preallocate(config.segment_preallocate);
 
+    if let Some(async_io_backend) = config.async_io_backend {
+        builder = builder.async_io_backend(async_io_backend);
+    }
+    if let Some(io_uring_queue_depth) = config.io_uring_queue_depth {
+        builder = builder.io_uring_queue_depth(io_uring_queue_depth);
+    }
+    if let Some(io_submit_batch_max) = config.io_submit_batch_max {
+        builder = builder.io_submit_batch_max(io_submit_batch_max);
+    }
+    if let Some(io_cqe_batch_max) = config.io_cqe_batch_max {
+        builder = builder.io_cqe_batch_max(io_cqe_batch_max);
+    }
+    if let Some(io_uring_register_files) = config.io_uring_register_files {
+        builder = builder.io_uring_register_files(io_uring_register_files);
+    }
+    if let Some(checksum_mode) = config.checksum_mode {
+        builder = builder.checksum_mode(checksum_mode);
+    }
+    if let Some(out_of_space_policy) = config.out_of_space_policy {
+        builder = builder.out_of_space_policy(out_of_space_policy);
+    }
+    if let Some(metadata_log_roll_bytes) = config.metadata_log_roll_bytes {
+        builder = builder.metadata_log_roll_bytes(metadata_log_roll_bytes);
+    }
+    if let Some(metadata_log_max_bytes) = config.metadata_log_max_bytes {
+        builder = builder.metadata_log_max_bytes(metadata_log_max_bytes);
+    }
     if let Some(max_disk_bytes) = config.max_disk_bytes {
         builder = builder.max_disk_bytes(max_disk_bytes);
     }
@@ -490,14 +626,26 @@ fn extract_pubsub_payload<'a>(
     (user_header, payload)
 }
 
-fn should_stop(
+fn bounded_stop_reason(
     messages_recorded: u64,
     max_messages: Option<u64>,
     elapsed: Duration,
     timeout: Option<Duration>,
-) -> bool {
-    max_messages.is_some_and(|max| messages_recorded >= max)
-        || timeout.is_some_and(|timeout| elapsed >= timeout)
+) -> Option<PubSubRecorderStopReason> {
+    if max_messages.is_some_and(|max| messages_recorded >= max) {
+        return Some(PubSubRecorderStopReason::MaxMessages);
+    }
+    if timeout.is_some_and(|timeout| elapsed >= timeout) {
+        return Some(PubSubRecorderStopReason::Timeout);
+    }
+    None
+}
+
+fn shutdown_requested(config: &PubSubRecorderConfig) -> bool {
+    config
+        .shutdown_requested
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 fn unix_time_now_ns() -> u64 {

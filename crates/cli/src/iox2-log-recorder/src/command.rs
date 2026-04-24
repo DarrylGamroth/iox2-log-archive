@@ -11,23 +11,28 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use iox2_log_archive_cli::Format;
 use iox2_log_archive_core::log_archive::{
-    ArchiveRecorderError, EffectiveAsyncIoBackend, PersistenceMode, RecorderAckLevel,
-    RecorderProfile,
+    ArchiveRecorderError, AsyncIoBackend, ChecksumMode, EffectiveAsyncIoBackend, OutOfSpacePolicy,
+    PersistenceMode, RecorderAckLevel, RecorderProfile,
 };
 use iox2_log_archive_iceoryx2::{
-    PubSubRecorderConfig, PubSubRecorderError,
+    PubSubRecorderConfig, PubSubRecorderError, PubSubRecorderStopReason,
     record_publish_subscribe as record_iceoryx2_publish_subscribe,
 };
 use serde::Serialize;
 
 use crate::cli::{
-    CliPersistenceMode, CliRecorderAckLevel, CliRecorderProfile, LogRecordAction,
-    LogRecordArchiveOptions, LogRecordPublishSubscribeOptions,
+    CliAsyncIoBackend, CliChecksumMode, CliOutOfSpacePolicy, CliPersistenceMode,
+    CliRecorderAckLevel, CliRecorderProfile, LogRecordAction, LogRecordArchiveOptions,
+    LogRecordPublishSubscribeOptions,
 };
 
 #[derive(Debug)]
@@ -133,7 +138,16 @@ struct RecordSummary<'a> {
     effective_async_io_backend: &'static str,
     default_ack_level: &'static str,
     requested_ack_level: Option<&'static str>,
+    stop_reason: &'static str,
     source_service_id: Option<u64>,
+    io_uring_queue_depth: u32,
+    io_submit_batch_max: u32,
+    io_cqe_batch_max: u32,
+    io_uring_register_files: bool,
+    checksum_mode: &'static str,
+    out_of_space_policy: &'static str,
+    metadata_log_roll_bytes: u64,
+    metadata_log_max_bytes: u64,
     flush_interval_ms: u64,
     max_messages: Option<u64>,
     timeout_ms: Option<u64>,
@@ -142,6 +156,13 @@ struct RecordSummary<'a> {
     elapsed_ms: u128,
     committed_records: u64,
     payload_bytes_committed: u64,
+    data_bytes_written: u64,
+    metadata_bytes_written: u64,
+    rolled_segments: u64,
+    preallocated_segments: u64,
+    out_of_space_events: u64,
+    metadata_log_rolls: u64,
+    write_amplification_ratio: f64,
     last_durable_data_sequence: Option<u64>,
     last_durable_commit_ordinal: Option<u64>,
     paused_at_shutdown: bool,
@@ -165,6 +186,7 @@ fn record_publish_subscribe(
     validate_runtime_options(&options.archive, &options.runtime.common)?;
     let paths = ArchivePaths::from_options(&options.archive)?;
     let requested_ack_level = options.runtime.common.ack_level.map(ack_level_from_cli);
+    let shutdown_requested = install_shutdown_handler()?;
 
     let summary = record_iceoryx2_publish_subscribe(PubSubRecorderConfig {
         service: paths.service.clone(),
@@ -177,12 +199,28 @@ fn record_publish_subscribe(
         spare_preallocated_segments: options.archive.spare_preallocated_segments,
         segment_preallocate: options.archive.segment_preallocate,
         max_disk_bytes: options.archive.max_disk_bytes,
+        async_io_backend: options
+            .archive
+            .async_io_backend
+            .map(async_io_backend_from_cli),
+        io_uring_queue_depth: options.archive.io_uring_queue_depth,
+        io_submit_batch_max: options.archive.io_submit_batch_max,
+        io_cqe_batch_max: options.archive.io_cqe_batch_max,
+        io_uring_register_files: options.archive.io_uring_register_files,
+        checksum_mode: options.archive.checksum_mode.map(checksum_mode_from_cli),
+        out_of_space_policy: options
+            .archive
+            .out_of_space_policy
+            .map(out_of_space_policy_from_cli),
+        metadata_log_roll_bytes: options.archive.metadata_log_roll_bytes,
+        metadata_log_max_bytes: options.archive.metadata_log_max_bytes,
         source_service_id: options.runtime.source_service_id,
         cycle_time: Duration::from_millis(options.runtime.common.cycle_time_ms),
         max_messages: options.runtime.common.max_messages,
         timeout: options.runtime.common.timeout_ms.map(Duration::from_millis),
         flush_interval: non_zero_duration(options.runtime.common.flush_interval_ms),
         ack_level: requested_ack_level,
+        shutdown_requested: Some(shutdown_requested),
     })
     .map_err(map_pubsub_recorder_error)?;
 
@@ -197,7 +235,16 @@ fn record_publish_subscribe(
         ),
         default_ack_level: ack_level_label(summary.default_ack_level),
         requested_ack_level: summary.requested_ack_level.map(ack_level_label),
+        stop_reason: stop_reason_label(summary.stop_reason),
         source_service_id: Some(summary.source_service_id),
+        io_uring_queue_depth: summary.io_uring_queue_depth,
+        io_submit_batch_max: summary.io_submit_batch_max,
+        io_cqe_batch_max: summary.io_cqe_batch_max,
+        io_uring_register_files: summary.io_uring_register_files,
+        checksum_mode: checksum_mode_label(summary.checksum_mode),
+        out_of_space_policy: out_of_space_policy_label(summary.out_of_space_policy),
+        metadata_log_roll_bytes: summary.metadata_log_roll_bytes,
+        metadata_log_max_bytes: summary.metadata_log_max_bytes,
         flush_interval_ms: options.runtime.common.flush_interval_ms,
         max_messages: summary.max_messages,
         timeout_ms: summary
@@ -208,6 +255,13 @@ fn record_publish_subscribe(
         elapsed_ms: summary.elapsed.as_millis(),
         committed_records: summary.committed_records,
         payload_bytes_committed: summary.payload_bytes_committed,
+        data_bytes_written: summary.data_bytes_written,
+        metadata_bytes_written: summary.metadata_bytes_written,
+        rolled_segments: summary.rolled_segments,
+        preallocated_segments: summary.preallocated_segments,
+        out_of_space_events: summary.out_of_space_events,
+        metadata_log_rolls: summary.metadata_log_rolls,
+        write_amplification_ratio: summary.write_amplification_ratio,
         last_durable_data_sequence: summary.last_durable_data_sequence,
         last_durable_commit_ordinal: summary.last_durable_commit_ordinal,
         paused_at_shutdown: summary.paused_at_shutdown,
@@ -233,8 +287,34 @@ fn validate_runtime_options(
             "--cycle-time-ms must be greater than 0".to_string(),
         ));
     }
+    if archive.io_uring_queue_depth == Some(0) {
+        return Err(LogRecordCommandError::InvalidInput(
+            "--io-uring-queue-depth must be greater than 0".to_string(),
+        ));
+    }
+    if archive.io_submit_batch_max == Some(0) {
+        return Err(LogRecordCommandError::InvalidInput(
+            "--io-submit-batch-max must be greater than 0".to_string(),
+        ));
+    }
+    if archive.io_cqe_batch_max == Some(0) {
+        return Err(LogRecordCommandError::InvalidInput(
+            "--io-cqe-batch-max must be greater than 0".to_string(),
+        ));
+    }
 
     Ok(())
+}
+
+fn install_shutdown_handler() -> Result<Arc<AtomicBool>, LogRecordCommandError> {
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&shutdown_requested);
+    ctrlc::set_handler(move || {
+        handler_flag.store(true, Ordering::SeqCst);
+    })
+    .with_context(|| "failed to install SIGINT/SIGTERM shutdown handler")
+    .map_err(LogRecordCommandError::Internal)?;
+    Ok(shutdown_requested)
 }
 
 fn non_zero_duration(value_ms: u64) -> Option<Duration> {
@@ -315,11 +395,19 @@ fn ack_level_label(value: RecorderAckLevel) -> &'static str {
     }
 }
 
-fn async_backend_label(value: iox2_log_archive_core::log_archive::AsyncIoBackend) -> &'static str {
+fn async_io_backend_from_cli(value: CliAsyncIoBackend) -> AsyncIoBackend {
     match value {
-        iox2_log_archive_core::log_archive::AsyncIoBackend::IoUringPreferred => "IoUringPreferred",
-        iox2_log_archive_core::log_archive::AsyncIoBackend::IoUringRequired => "IoUringRequired",
-        iox2_log_archive_core::log_archive::AsyncIoBackend::Blocking => "Blocking",
+        CliAsyncIoBackend::IoUringPreferred => AsyncIoBackend::IoUringPreferred,
+        CliAsyncIoBackend::IoUringRequired => AsyncIoBackend::IoUringRequired,
+        CliAsyncIoBackend::Blocking => AsyncIoBackend::Blocking,
+    }
+}
+
+fn async_backend_label(value: AsyncIoBackend) -> &'static str {
+    match value {
+        AsyncIoBackend::IoUringPreferred => "IoUringPreferred",
+        AsyncIoBackend::IoUringRequired => "IoUringRequired",
+        AsyncIoBackend::Blocking => "Blocking",
     }
 }
 
@@ -327,6 +415,42 @@ fn effective_async_backend_label(value: EffectiveAsyncIoBackend) -> &'static str
     match value {
         EffectiveAsyncIoBackend::IoUring => "IoUring",
         EffectiveAsyncIoBackend::Blocking => "Blocking",
+    }
+}
+
+fn checksum_mode_from_cli(value: CliChecksumMode) -> ChecksumMode {
+    match value {
+        CliChecksumMode::None => ChecksumMode::None,
+        CliChecksumMode::Crc32c => ChecksumMode::Crc32c,
+    }
+}
+
+fn checksum_mode_label(value: ChecksumMode) -> &'static str {
+    match value {
+        ChecksumMode::None => "None",
+        ChecksumMode::Crc32c => "Crc32c",
+    }
+}
+
+fn out_of_space_policy_from_cli(value: CliOutOfSpacePolicy) -> OutOfSpacePolicy {
+    match value {
+        CliOutOfSpacePolicy::FailWriter => OutOfSpacePolicy::FailWriter,
+    }
+}
+
+fn out_of_space_policy_label(value: OutOfSpacePolicy) -> &'static str {
+    match value {
+        OutOfSpacePolicy::FailWriter => "FailWriter",
+    }
+}
+
+fn stop_reason_label(value: PubSubRecorderStopReason) -> &'static str {
+    match value {
+        PubSubRecorderStopReason::ControlStop => "ControlStop",
+        PubSubRecorderStopReason::ShutdownRequested => "ShutdownRequested",
+        PubSubRecorderStopReason::MaxMessages => "MaxMessages",
+        PubSubRecorderStopReason::Timeout => "Timeout",
+        PubSubRecorderStopReason::WaitInterrupted => "WaitInterrupted",
     }
 }
 

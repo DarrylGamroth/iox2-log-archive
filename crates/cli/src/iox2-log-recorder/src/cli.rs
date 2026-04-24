@@ -66,6 +66,27 @@ pub enum CliRecorderAckLevel {
     DurableDataAndCommitLog,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CliAsyncIoBackend {
+    IoUringPreferred,
+    IoUringRequired,
+    Blocking,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CliChecksumMode {
+    None,
+    Crc32c,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CliOutOfSpacePolicy {
+    FailWriter,
+}
+
 #[derive(Clone, Debug, Args)]
 pub struct LogRecordArchiveOptions {
     #[clap(long, help = "Logical service name to record.")]
@@ -100,6 +121,41 @@ pub struct LogRecordArchiveOptions {
 
     #[clap(long)]
     pub max_disk_bytes: Option<u64>,
+
+    #[clap(
+        long,
+        value_enum,
+        help = "Override async data-path backend. If omitted, the selected profile decides."
+    )]
+    pub async_io_backend: Option<CliAsyncIoBackend>,
+
+    #[clap(long, help = "Override Linux io_uring queue depth.")]
+    pub io_uring_queue_depth: Option<u32>,
+
+    #[clap(long, help = "Override maximum io_uring submissions per batch.")]
+    pub io_submit_batch_max: Option<u32>,
+
+    #[clap(long, help = "Override maximum io_uring completions reaped per batch.")]
+    pub io_cqe_batch_max: Option<u32>,
+
+    #[clap(
+        long,
+        action = ArgAction::Set,
+        help = "Override io_uring registered-file mode."
+    )]
+    pub io_uring_register_files: Option<bool>,
+
+    #[clap(long, value_enum, help = "Override persisted frame checksum mode.")]
+    pub checksum_mode: Option<CliChecksumMode>,
+
+    #[clap(long, value_enum, help = "Override disk-full handling policy.")]
+    pub out_of_space_policy: Option<CliOutOfSpacePolicy>,
+
+    #[clap(long, help = "Override active metadata-log roll threshold in bytes.")]
+    pub metadata_log_roll_bytes: Option<u64>,
+
+    #[clap(long, help = "Override global metadata-log size cap in bytes.")]
+    pub metadata_log_max_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Args)]

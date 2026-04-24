@@ -17,7 +17,14 @@
 
 - Replace the pinned upstream git dependency with the selected released crate version.
 - Track the dynamic type-detail API gap in `docs/iceoryx2-api-audit.md` and replace it once upstream exposes a stable hook.
-- Update `iox2-log-archive-orchestrator` release packaging to consume these external binaries.
+- `iox2-log-archive-orchestrator` consumes these external binaries through configurable recorder/control binary paths.
+
+## Operational Status
+
+- Active transport scope is pub-sub only.
+- Recorder shutdown is cooperative for control `stop` and process `SIGINT`/`SIGTERM`.
+- Production tuning overrides are exposed in `iox2-log-recorder` and can be passed through the orchestrator desired state.
+- Release gates and compatibility policy are documented in `docs/release-readiness.md`.
 
 ## Verification
 

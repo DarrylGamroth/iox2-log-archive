@@ -20,7 +20,8 @@ use iox2_log_archive_iceoryx2::{
     LOG_RECORDER_CONTROL_CMD_FLUSH, LOG_RECORDER_CONTROL_CMD_PAUSE,
     LOG_RECORDER_CONTROL_CMD_RESUME, LOG_RECORDER_CONTROL_CMD_STATUS,
     LOG_RECORDER_CONTROL_CMD_STOP, LogRecorderControlClientConfig, LogRecorderControlError,
-    PubSubRecorderConfig, record_publish_subscribe, request_recorder_control,
+    PubSubRecorderConfig, PubSubRecorderStopReason, record_publish_subscribe,
+    request_recorder_control,
 };
 
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -61,12 +62,22 @@ fn pubsub_recorder_accepts_live_control_commands() {
             spare_preallocated_segments: 0,
             segment_preallocate: false,
             max_disk_bytes: None,
+            async_io_backend: None,
+            io_uring_queue_depth: None,
+            io_submit_batch_max: None,
+            io_cqe_batch_max: None,
+            io_uring_register_files: None,
+            checksum_mode: None,
+            out_of_space_policy: None,
+            metadata_log_roll_bytes: None,
+            metadata_log_max_bytes: None,
             source_service_id: None,
             cycle_time: Duration::from_millis(5),
             max_messages: None,
             timeout: Some(Duration::from_secs(30)),
             flush_interval: Some(Duration::from_millis(25)),
             ack_level: None,
+            shutdown_requested: None,
         })
     });
 
@@ -104,6 +115,7 @@ fn pubsub_recorder_accepts_live_control_commands() {
     assert!(stopped.committed_records >= 3);
 
     let summary = recorder.join().unwrap().unwrap();
+    assert_eq!(summary.stop_reason, PubSubRecorderStopReason::ControlStop);
     assert!(summary.messages_recorded >= 3);
     assert!(summary.dropped_while_paused >= 3);
     assert!(!summary.paused_at_shutdown);

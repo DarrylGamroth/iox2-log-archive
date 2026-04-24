@@ -923,6 +923,21 @@ impl ArchiveRecorder {
         self.config.io_cqe_batch_max
     }
 
+    /// Returns configured io_uring registered-file mode.
+    pub fn io_uring_register_files(&self) -> bool {
+        self.config.io_uring_register_files
+    }
+
+    /// Returns configured checksum mode.
+    pub fn checksum_mode(&self) -> ChecksumMode {
+        self.config.checksum_mode
+    }
+
+    /// Returns configured out-of-space policy.
+    pub fn out_of_space_policy(&self) -> OutOfSpacePolicy {
+        self.config.out_of_space_policy
+    }
+
     /// Returns configured metadata-log roll threshold in bytes.
     pub fn metadata_log_roll_bytes(&self) -> u64 {
         self.config.metadata_log_roll_bytes
