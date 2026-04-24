@@ -12,7 +12,10 @@
 
 //! iceoryx2 request-response control protocol for live recorder workers.
 
+use std::time::{Duration, Instant};
+
 use iceoryx2::prelude::ZeroCopySend;
+use iceoryx2::prelude::*;
 
 /// Recorder control protocol version.
 pub const LOG_RECORDER_CONTROL_PROTOCOL_VERSION: u16 = 3;
@@ -170,4 +173,225 @@ pub const fn decode_optional_u64(value: u64) -> Option<u64> {
     } else {
         Some(value)
     }
+}
+
+/// Configuration for one recorder control request.
+#[derive(Debug, Clone)]
+pub struct LogRecorderControlClientConfig {
+    /// Recorded service name.
+    pub service: String,
+    /// Control client node name.
+    pub node_name: String,
+    /// Response timeout.
+    pub timeout: Duration,
+}
+
+/// Response data for one recorder control request.
+#[derive(Debug, Clone)]
+pub struct LogRecorderControlResult {
+    /// Control service name used.
+    pub control_service: String,
+    /// Daemon status.
+    pub daemon_status: LogRecorderDaemonStatus,
+    /// Whether the recorder is paused.
+    pub is_paused: bool,
+    /// Samples dropped while paused.
+    pub dropped_while_paused: u64,
+    /// Pause start timestamp in ns.
+    pub paused_since_ns: Option<u64>,
+    /// Number of committed records.
+    pub committed_records: u64,
+    /// Number of committed payload bytes.
+    pub payload_bytes_committed: u64,
+    /// Number of archive data bytes written.
+    pub data_bytes_written: u64,
+    /// Number of metadata bytes written.
+    pub metadata_bytes_written: u64,
+    /// Last durable data sequence.
+    pub last_durable_data_sequence: Option<u64>,
+    /// Last durable commit ordinal.
+    pub last_durable_commit_ordinal: Option<u64>,
+}
+
+/// Normalized daemon status.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LogRecorderDaemonStatus {
+    /// Request completed successfully.
+    Ok,
+}
+
+/// Error returned by recorder control clients.
+#[derive(Debug)]
+pub enum LogRecorderControlError {
+    /// Invalid input.
+    InvalidInput(String),
+    /// Control service or daemon is unavailable.
+    NotAvailable(String),
+    /// iceoryx2 client failure.
+    Iceoryx2(String),
+}
+
+impl core::fmt::Display for LogRecorderControlError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidInput(message) | Self::NotAvailable(message) | Self::Iceoryx2(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for LogRecorderControlError {}
+
+/// Sends one command to a running recorder daemon.
+pub fn request_recorder_control(
+    config: LogRecorderControlClientConfig,
+    command: u16,
+) -> Result<LogRecorderControlResult, LogRecorderControlError> {
+    validate_control_config(&config)?;
+
+    let control_service = log_recorder_control_service_name(&config.service);
+    let node = NodeBuilder::new()
+        .name(&NodeName::new(&config.node_name).map_err(to_control_iox2_error)?)
+        .create::<ipc::Service>()
+        .map_err(to_control_iox2_error)?;
+
+    let control_service_name = ServiceName::new(&control_service).map_err(to_control_iox2_error)?;
+
+    let request_response = node
+        .service_builder(&control_service_name)
+        .request_response::<LogRecorderControlRequest, LogRecorderControlResponse>()
+        .open()
+        .map_err(|_| {
+            LogRecorderControlError::NotAvailable(format!(
+                "recorder daemon control service '{control_service}' is not available",
+            ))
+        })?;
+
+    let client = request_response
+        .client_builder()
+        .create()
+        .map_err(to_control_iox2_error)?;
+
+    let response = send_request(
+        &node,
+        &client,
+        LogRecorderControlRequest::new(command),
+        config.timeout,
+    )?;
+
+    let daemon_status = match response.status {
+        LOG_RECORDER_CONTROL_STATUS_OK => LogRecorderDaemonStatus::Ok,
+        LOG_RECORDER_CONTROL_STATUS_INVALID_REQUEST => {
+            return Err(LogRecorderControlError::InvalidInput(
+                "daemon rejected command as invalid".to_string(),
+            ));
+        }
+        LOG_RECORDER_CONTROL_STATUS_INTERNAL_ERROR => {
+            return Err(LogRecorderControlError::NotAvailable(
+                "daemon failed to execute command".to_string(),
+            ));
+        }
+        status => {
+            return Err(LogRecorderControlError::Iceoryx2(format!(
+                "daemon returned unknown status code {status}",
+            )));
+        }
+    };
+
+    let is_paused = match response.state {
+        LOG_RECORDER_CONTROL_STATE_RUNNING => false,
+        LOG_RECORDER_CONTROL_STATE_PAUSED => true,
+        state => {
+            return Err(LogRecorderControlError::Iceoryx2(format!(
+                "daemon returned unknown state code {state}",
+            )));
+        }
+    };
+
+    Ok(LogRecorderControlResult {
+        control_service,
+        daemon_status,
+        is_paused,
+        dropped_while_paused: response.dropped_while_paused,
+        paused_since_ns: decode_optional_u64(response.paused_since_ns),
+        committed_records: response.committed_records,
+        payload_bytes_committed: response.payload_bytes_committed,
+        data_bytes_written: response.data_bytes_written,
+        metadata_bytes_written: response.metadata_bytes_written,
+        last_durable_data_sequence: decode_optional_u64(response.last_durable_data_sequence),
+        last_durable_commit_ordinal: decode_optional_u64(response.last_durable_commit_ordinal),
+    })
+}
+
+fn validate_control_config(
+    config: &LogRecorderControlClientConfig,
+) -> Result<(), LogRecorderControlError> {
+    if config.service.trim().is_empty() {
+        return Err(LogRecorderControlError::InvalidInput(
+            "service must not be empty".to_string(),
+        ));
+    }
+    if config.node_name.trim().is_empty() {
+        return Err(LogRecorderControlError::InvalidInput(
+            "node_name must not be empty".to_string(),
+        ));
+    }
+    if config.timeout.is_zero() {
+        return Err(LogRecorderControlError::InvalidInput(
+            "timeout must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn send_request(
+    node: &Node<ipc::Service>,
+    client: &iceoryx2::port::client::Client<
+        ipc::Service,
+        LogRecorderControlRequest,
+        (),
+        LogRecorderControlResponse,
+        (),
+    >,
+    request: LogRecorderControlRequest,
+    timeout: Duration,
+) -> Result<LogRecorderControlResponse, LogRecorderControlError> {
+    let pending_response = client.send_copy(request).map_err(to_control_iox2_error)?;
+
+    if pending_response.number_of_server_connections() == 0 {
+        return Err(LogRecorderControlError::NotAvailable(
+            "recorder daemon is not connected to control service".to_string(),
+        ));
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(response) = pending_response.receive().map_err(to_control_iox2_error)? {
+            if response.protocol_version != LOG_RECORDER_CONTROL_PROTOCOL_VERSION {
+                return Err(LogRecorderControlError::NotAvailable(format!(
+                    "daemon protocol version mismatch: expected {}, got {}",
+                    LOG_RECORDER_CONTROL_PROTOCOL_VERSION, response.protocol_version
+                )));
+            }
+
+            return Ok(*response);
+        }
+
+        if Instant::now() >= deadline {
+            return Err(LogRecorderControlError::NotAvailable(
+                "timed out waiting for recorder daemon response".to_string(),
+            ));
+        }
+
+        if node.wait(Duration::from_millis(2)).is_err() {
+            return Err(LogRecorderControlError::NotAvailable(
+                "control client wait interrupted while awaiting response".to_string(),
+            ));
+        }
+    }
+}
+
+fn to_control_iox2_error(error: impl core::fmt::Debug) -> LogRecorderControlError {
+    LogRecorderControlError::Iceoryx2(format!("{error:?}"))
 }

@@ -10,18 +10,17 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use iceoryx2::prelude::*;
 use iox2_log_archive_cli::{
     Format, LOG_RECORDER_CONTROL_CMD_FLUSH, LOG_RECORDER_CONTROL_CMD_PAUSE,
     LOG_RECORDER_CONTROL_CMD_RESUME, LOG_RECORDER_CONTROL_CMD_STATUS,
-    LOG_RECORDER_CONTROL_CMD_STOP, LOG_RECORDER_CONTROL_PROTOCOL_VERSION,
-    LOG_RECORDER_CONTROL_STATE_PAUSED, LOG_RECORDER_CONTROL_STATE_RUNNING,
-    LOG_RECORDER_CONTROL_STATUS_INTERNAL_ERROR, LOG_RECORDER_CONTROL_STATUS_INVALID_REQUEST,
-    LOG_RECORDER_CONTROL_STATUS_OK, LogRecorderControlRequest, LogRecorderControlResponse,
-    decode_optional_u64, log_recorder_control_service_name,
+    LOG_RECORDER_CONTROL_CMD_STOP,
+};
+use iox2_log_archive_iceoryx2::{
+    LogRecorderControlClientConfig, LogRecorderControlError, LogRecorderDaemonStatus,
+    request_recorder_control,
 };
 use serde::Serialize;
 
@@ -131,84 +130,30 @@ fn execute(
 ) -> Result<(), LogControlCommandError> {
     validate_options(&options)?;
 
-    let control_service = log_recorder_control_service_name(&options.service);
-    let node = NodeBuilder::new()
-        .name(
-            &NodeName::new(&options.node_name)
-                .map_err(|error| LogControlCommandError::Internal(anyhow!(error)))?,
-        )
-        .create::<ipc::Service>()
-        .map_err(|error| LogControlCommandError::Internal(anyhow!(error)))?;
-
-    let control_service_name = ServiceName::new(&control_service)
-        .map_err(|error| LogControlCommandError::Internal(anyhow!(error)))?;
-
-    let request_response = node
-        .service_builder(&control_service_name)
-        .request_response::<LogRecorderControlRequest, LogRecorderControlResponse>()
-        .open()
-        .map_err(|_| {
-            LogControlCommandError::NotAvailable(format!(
-                "recorder daemon control service '{}' is not available",
-                control_service
-            ))
-        })?;
-
-    let client = request_response
-        .client_builder()
-        .create()
-        .map_err(|error| LogControlCommandError::Internal(anyhow!(error)))?;
-
-    let response = send_request(
-        &node,
-        &client,
-        LogRecorderControlRequest::new(command),
-        Duration::from_millis(options.timeout_ms),
-    )?;
-
-    let daemon_status = match response.status {
-        LOG_RECORDER_CONTROL_STATUS_OK => "Ok",
-        LOG_RECORDER_CONTROL_STATUS_INVALID_REQUEST => {
-            return Err(LogControlCommandError::InvalidInput(format!(
-                "daemon rejected {operation} command as invalid"
-            )));
-        }
-        LOG_RECORDER_CONTROL_STATUS_INTERNAL_ERROR => {
-            return Err(LogControlCommandError::NotAvailable(format!(
-                "daemon failed to execute {operation} command"
-            )));
-        }
-        status => {
-            return Err(LogControlCommandError::Internal(anyhow!(
-                "daemon returned unknown status code {status}"
-            )));
-        }
-    };
-
-    let is_paused = match response.state {
-        LOG_RECORDER_CONTROL_STATE_RUNNING => false,
-        LOG_RECORDER_CONTROL_STATE_PAUSED => true,
-        state => {
-            return Err(LogControlCommandError::Internal(anyhow!(
-                "daemon returned unknown state code {state}"
-            )));
-        }
-    };
+    let result = request_recorder_control(
+        LogRecorderControlClientConfig {
+            service: options.service.clone(),
+            node_name: options.node_name.clone(),
+            timeout: Duration::from_millis(options.timeout_ms),
+        },
+        command,
+    )
+    .map_err(|error| map_control_error(error, operation))?;
 
     let payload = ControlResult {
         operation,
         service: &options.service,
-        control_service,
-        daemon_status,
-        is_paused,
-        dropped_while_paused: response.dropped_while_paused,
-        paused_since_ns: decode_optional_u64(response.paused_since_ns),
-        committed_records: response.committed_records,
-        payload_bytes_committed: response.payload_bytes_committed,
-        data_bytes_written: response.data_bytes_written,
-        metadata_bytes_written: response.metadata_bytes_written,
-        last_durable_data_sequence: decode_optional_u64(response.last_durable_data_sequence),
-        last_durable_commit_ordinal: decode_optional_u64(response.last_durable_commit_ordinal),
+        control_service: result.control_service,
+        daemon_status: daemon_status_label(result.daemon_status),
+        is_paused: result.is_paused,
+        dropped_while_paused: result.dropped_while_paused,
+        paused_since_ns: result.paused_since_ns,
+        committed_records: result.committed_records,
+        payload_bytes_committed: result.payload_bytes_committed,
+        data_bytes_written: result.data_bytes_written,
+        metadata_bytes_written: result.metadata_bytes_written,
+        last_durable_data_sequence: result.last_durable_data_sequence,
+        last_durable_commit_ordinal: result.last_durable_commit_ordinal,
     };
 
     print_output(&payload, format)
@@ -230,55 +175,34 @@ fn validate_options(options: &LogControlOptions) -> Result<(), LogControlCommand
     Ok(())
 }
 
-fn send_request(
-    node: &Node<ipc::Service>,
-    client: &iceoryx2::port::client::Client<
-        ipc::Service,
-        LogRecorderControlRequest,
-        (),
-        LogRecorderControlResponse,
-        (),
-    >,
-    request: LogRecorderControlRequest,
-    timeout: Duration,
-) -> Result<LogRecorderControlResponse, LogControlCommandError> {
-    let pending_response = client
-        .send_copy(request)
-        .map_err(|error| LogControlCommandError::Internal(anyhow!(error)))?;
-
-    if pending_response.number_of_server_connections() == 0 {
-        return Err(LogControlCommandError::NotAvailable(
-            "recorder daemon is not connected to control service".to_string(),
-        ));
+fn map_control_error(
+    error: LogRecorderControlError,
+    operation: &'static str,
+) -> LogControlCommandError {
+    match error {
+        LogRecorderControlError::InvalidInput(message) => {
+            LogControlCommandError::InvalidInput(if message.contains("daemon rejected") {
+                format!("daemon rejected {operation} command as invalid")
+            } else {
+                message
+            })
+        }
+        LogRecorderControlError::NotAvailable(message) => {
+            LogControlCommandError::NotAvailable(if message.contains("daemon failed") {
+                format!("daemon failed to execute {operation} command")
+            } else {
+                message
+            })
+        }
+        LogRecorderControlError::Iceoryx2(message) => {
+            LogControlCommandError::Internal(anyhow!(message))
+        }
     }
+}
 
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(response) = pending_response
-            .receive()
-            .map_err(|error| LogControlCommandError::Internal(anyhow!(error)))?
-        {
-            if response.protocol_version != LOG_RECORDER_CONTROL_PROTOCOL_VERSION {
-                return Err(LogControlCommandError::NotAvailable(format!(
-                    "daemon protocol version mismatch: expected {}, got {}",
-                    LOG_RECORDER_CONTROL_PROTOCOL_VERSION, response.protocol_version
-                )));
-            }
-
-            return Ok(*response);
-        }
-
-        if Instant::now() >= deadline {
-            return Err(LogControlCommandError::NotAvailable(
-                "timed out waiting for recorder daemon response".to_string(),
-            ));
-        }
-
-        if node.wait(Duration::from_millis(2)).is_err() {
-            return Err(LogControlCommandError::NotAvailable(
-                "control client wait interrupted while awaiting response".to_string(),
-            ));
-        }
+fn daemon_status_label(value: LogRecorderDaemonStatus) -> &'static str {
+    match value {
+        LogRecorderDaemonStatus::Ok => "Ok",
     }
 }
 
