@@ -17,7 +17,9 @@
 //! iceoryx2 publish-subscribe services.
 
 mod control;
+mod record;
 mod rematerialize;
 
 pub use control::*;
+pub use record::*;
 pub use rematerialize::*;
