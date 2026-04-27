@@ -10,7 +10,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::cmp::min;
@@ -18,6 +18,8 @@ use core::num::NonZeroUsize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::common::*;
 use super::storage::read_commit_entries;
@@ -61,6 +63,21 @@ impl ArchiveReplayerBuilder {
 
     /// Opens archive replayer.
     pub fn open(self) -> Result<ArchiveReplayer, ArchiveReplayError> {
+        self.open_snapshot()
+    }
+
+    /// Opens live archive replayer.
+    ///
+    /// Live replay is explicit: snapshot replay remains deterministic, while
+    /// callers that need recorder-following behavior can refresh visibility as
+    /// new commit-log entries are appended.
+    pub fn open_live(self) -> Result<ArchiveLiveReplayer, ArchiveReplayError> {
+        Ok(ArchiveLiveReplayer {
+            replayer: self.open_snapshot()?,
+        })
+    }
+
+    fn open_snapshot(self) -> Result<ArchiveReplayer, ArchiveReplayError> {
         if !self.verify_checksums {
             return Err(ArchiveReplayError::InvalidConfiguration(
                 "checksum verification cannot be disabled",
@@ -77,29 +94,15 @@ impl ArchiveReplayerBuilder {
         }
 
         let segments_path = self.storage_path.join("segments");
-        let commit_log_entries = read_commit_entries(&commit_log_path)?;
-        let mut index_by_sequence = BTreeMap::new();
-        for entry in &commit_log_entries {
-            let hot_segment_path = segment_data_path(
-                &segments_path,
-                entry.locator.segment_id,
-                entry.locator.segment_generation,
-            );
-            if !hot_segment_path.exists() {
-                continue;
-            }
-            if index_by_sequence.insert(entry.sequence, *entry).is_some() {
-                return Err(ArchiveReplayError::DuplicateSequence(entry.sequence));
-            }
-        }
-        let ordered_sequences: Vec<u64> = index_by_sequence.keys().copied().collect();
+        let snapshot = load_replayer_snapshot(&segments_path, &commit_log_path)?;
 
         Ok(ArchiveReplayer {
             segments_path,
             metadata_log_path: metadata_root,
-            commit_log_entries,
-            index_by_sequence,
-            ordered_sequences,
+            commit_log_path,
+            commit_log_entries: snapshot.commit_log_entries,
+            index_by_sequence: snapshot.index_by_sequence,
+            ordered_sequences: snapshot.ordered_sequences,
             cursor: 0,
             replay_budget: self.replay_budget,
             verify_checksums: self.verify_checksums,
@@ -108,11 +111,47 @@ impl ArchiveReplayerBuilder {
     }
 }
 
+#[derive(Debug)]
+struct ReplayerSnapshot {
+    commit_log_entries: Vec<CommitEntry>,
+    index_by_sequence: BTreeMap<u64, CommitEntry>,
+    ordered_sequences: Vec<u64>,
+}
+
+fn load_replayer_snapshot(
+    segments_path: &Path,
+    commit_log_path: &Path,
+) -> Result<ReplayerSnapshot, ArchiveReplayError> {
+    let commit_log_entries = read_commit_entries(commit_log_path)?;
+    let mut index_by_sequence = BTreeMap::new();
+    for entry in &commit_log_entries {
+        let hot_segment_path = segment_data_path(
+            segments_path,
+            entry.locator.segment_id,
+            entry.locator.segment_generation,
+        );
+        if !hot_segment_path.exists() {
+            continue;
+        }
+        if index_by_sequence.insert(entry.sequence, *entry).is_some() {
+            return Err(ArchiveReplayError::DuplicateSequence(entry.sequence));
+        }
+    }
+    let ordered_sequences: Vec<u64> = index_by_sequence.keys().copied().collect();
+
+    Ok(ReplayerSnapshot {
+        commit_log_entries,
+        index_by_sequence,
+        ordered_sequences,
+    })
+}
+
 /// Replayer core for archived segment data.
 #[derive(Debug)]
 pub struct ArchiveReplayer {
     segments_path: PathBuf,
     metadata_log_path: PathBuf,
+    commit_log_path: PathBuf,
     commit_log_entries: Vec<CommitEntry>,
     index_by_sequence: BTreeMap<u64, CommitEntry>,
     ordered_sequences: Vec<u64>,
@@ -123,6 +162,38 @@ pub struct ArchiveReplayer {
 }
 
 impl ArchiveReplayer {
+    fn refresh_snapshot(&mut self) -> Result<usize, ArchiveReplayError> {
+        let previous_sequences: BTreeSet<u64> = self.index_by_sequence.keys().copied().collect();
+        let snapshot = load_replayer_snapshot(&self.segments_path, &self.commit_log_path)?;
+        let newly_visible_records = snapshot
+            .ordered_sequences
+            .iter()
+            .filter(|sequence| !previous_sequences.contains(sequence))
+            .count();
+        self.commit_log_entries = snapshot.commit_log_entries;
+        self.index_by_sequence = snapshot.index_by_sequence;
+        self.ordered_sequences = snapshot.ordered_sequences;
+        self.cursor = self.cursor.min(self.ordered_sequences.len());
+
+        Ok(newly_visible_records)
+    }
+
+    fn live_status(&self) -> LiveReplayStatus {
+        let last_visible_sequence = self.ordered_sequences.last().copied();
+        let last_visible_commit_ordinal = self
+            .index_by_sequence
+            .values()
+            .map(|entry| entry.commit_ordinal)
+            .max()
+            .unwrap_or(0);
+
+        LiveReplayStatus {
+            visible_records: self.ordered_sequences.len(),
+            last_visible_sequence,
+            last_visible_commit_ordinal,
+        }
+    }
+
     /// Returns current replay budget.
     pub fn replay_budget(&self) -> ReplayBudget {
         self.replay_budget
@@ -549,6 +620,98 @@ impl ArchiveReplayer {
             frame_checksum,
             locator,
         })
+    }
+}
+
+/// Visible live replay boundary.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct LiveReplayStatus {
+    /// Number of currently visible hot-attached records.
+    pub visible_records: usize,
+    /// Highest visible archive sequence.
+    pub last_visible_sequence: Option<u64>,
+    /// Highest visible commit ordinal.
+    pub last_visible_commit_ordinal: u64,
+}
+
+/// Explicit live/follow replayer.
+#[derive(Debug)]
+pub struct ArchiveLiveReplayer {
+    replayer: ArchiveReplayer,
+}
+
+impl ArchiveLiveReplayer {
+    /// Returns the underlying replay budget.
+    pub fn replay_budget(&self) -> ReplayBudget {
+        self.replayer.replay_budget()
+    }
+
+    /// Sets replay budget.
+    pub fn set_replay_budget(&mut self, value: ReplayBudget) {
+        self.replayer.set_replay_budget(value);
+    }
+
+    /// Returns the current visible live replay boundary.
+    pub fn status(&self) -> LiveReplayStatus {
+        self.replayer.live_status()
+    }
+
+    /// Refreshes commit-log visibility and returns the count of newly visible records.
+    pub fn refresh(&mut self) -> Result<usize, ArchiveReplayError> {
+        self.replayer.refresh_snapshot()
+    }
+
+    /// Positions live cursor to the first visible sequence `>= sequence`.
+    pub fn seek(&mut self, sequence: u64) {
+        self.replayer.seek(sequence);
+    }
+
+    /// Reads a visible record by archive sequence.
+    pub fn read_at_sequence(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<ReplayedFrame>, ArchiveReplayError> {
+        self.replayer.read_at_sequence(sequence)
+    }
+
+    /// Reads visible records starting from `start_sequence`.
+    pub fn read_range(
+        &self,
+        start_sequence: u64,
+        max_records: NonZeroUsize,
+    ) -> Result<Vec<ReplayedFrame>, ArchiveReplayError> {
+        self.replayer.read_range(start_sequence, max_records)
+    }
+
+    /// Reads next currently visible batch from the live cursor.
+    pub fn next_batch(
+        &mut self,
+        max_records: NonZeroUsize,
+    ) -> Result<Vec<ReplayedFrame>, ArchiveReplayError> {
+        self.replayer.next_batch(max_records)
+    }
+
+    /// Waits for the next visible batch from the live cursor.
+    ///
+    /// Returns an empty batch when `timeout` elapses before new records become
+    /// visible. `poll_interval` values of zero are treated as a single refresh.
+    pub fn next_live_batch(
+        &mut self,
+        max_records: NonZeroUsize,
+        poll_interval: Duration,
+        timeout: Duration,
+    ) -> Result<Vec<ReplayedFrame>, ArchiveReplayError> {
+        let started = Instant::now();
+        loop {
+            self.refresh()?;
+            let batch = self.next_batch(max_records)?;
+            if !batch.is_empty() || started.elapsed() >= timeout || poll_interval.is_zero() {
+                return Ok(batch);
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            thread::sleep(poll_interval.min(remaining));
+        }
     }
 }
 

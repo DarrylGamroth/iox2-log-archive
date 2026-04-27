@@ -256,6 +256,20 @@ iox2-log-replay --format JSON replay \
   all
 ```
 
+Follow a recorder and replay newly committed records until idle:
+
+```bash
+iox2-log-replay --format JSON replay \
+  --storage-path /var/lib/iox2-log-archive/My_Camera_Frames/storage \
+  --metadata-log-path /var/lib/iox2-log-archive/My_Camera_Frames/metadata \
+  --to publish-subscribe \
+  --service My/Camera/Frames/Replay \
+  --follow \
+  --follow-poll-ms 100 \
+  --follow-idle-timeout-ms 5000 \
+  all
+```
+
 Replay a range:
 
 ```bash
@@ -317,6 +331,9 @@ Replay rate options:
 | `--rate fixed --messages-per-sec <n>` | Emit at a fixed message rate. |
 | `--skip-missing` | Continue past missing selectors. |
 | `--max-errors <n>` | Bound tolerated replay errors. |
+| `--follow` | Refresh `commit.idxlog` and follow newly committed records for `all`, `sequence`, and `range` selectors. |
+| `--follow-poll-ms <n>` | Poll interval for `--follow`; default `100`. |
+| `--follow-idle-timeout-ms <n>` | Stop `--follow` after this many milliseconds without new visible records. |
 
 ## Tool Boundaries
 

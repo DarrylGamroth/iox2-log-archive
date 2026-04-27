@@ -435,6 +435,81 @@ fn replay_all_replays_every_record() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn replay_follow_streams_records_committed_after_startup() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+
+    let mut recorder = ArchiveRecorderBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .segment_bytes(1024)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .persistence_mode(PersistenceMode::Async)
+        .checksum_mode(ChecksumMode::Crc32c)
+        .create()?;
+
+    let payload = vec![0x11; 8];
+    recorder.append_publish_subscribe_record(PublishSubscribeRecordInput {
+        event_time_ns: 1_000,
+        source_service_id: 1,
+        source_publisher_id: 1,
+        source_sequence: Some(1),
+        user_header: &[0xA1, 1],
+        payload: &payload,
+    })?;
+    recorder.flush()?;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_iox2-log-replay"))
+        .args([
+            "--format",
+            "JSON",
+            "replay",
+            "--storage-path",
+            storage_path.to_str().expect("utf-8 storage path"),
+            "--metadata-log-path",
+            metadata_path.to_str().expect("utf-8 metadata path"),
+            "--to",
+            "stdout",
+            "--follow",
+            "--follow-poll-ms",
+            "10",
+            "--follow-idle-timeout-ms",
+            "250",
+            "all",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    thread::sleep(Duration::from_millis(50));
+    for sequence in 2..=3u64 {
+        let payload = vec![sequence as u8; 8];
+        recorder.append_publish_subscribe_record(PublishSubscribeRecordInput {
+            event_time_ns: sequence * 1_000,
+            source_service_id: 1,
+            source_publisher_id: 1,
+            source_sequence: Some(sequence),
+            user_header: &[0xA1, sequence as u8],
+            payload: &payload,
+        })?;
+        recorder.flush()?;
+    }
+    recorder.finalize()?;
+
+    let output = wait_for_child(child, "replay follow")?;
+    assert_success(&output, "replay follow");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 3);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"live_mode\": true"));
+    assert!(stderr.contains("\"last_visible_sequence\": 3"));
+    assert!(stderr.contains("\"emitted\": 3"));
+
+    Ok(())
+}
+
+#[test]
 fn recorder_help_exposes_general_throughput_profile_only() -> Result<(), Box<dyn std::error::Error>>
 {
     let help = Command::new(env!("CARGO_BIN_EXE_iox2-log-recorder"))

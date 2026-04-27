@@ -544,3 +544,93 @@ fn log_archive_phase6_replay_budget_isolates_ingest_progress_under_concurrent_re
     assert_that!(replayed.len(), eq 2048);
     assert_that!(replayed.last().unwrap().sequence, eq 2048);
 }
+
+#[test]
+fn log_archive_live_replayer_refreshes_visibility_without_changing_snapshot_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+
+    let mut recorder = ArchiveRecorderBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .profile(RecorderProfile::Replay)
+        .segment_bytes(1024 * 1024)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .persistence_mode(PersistenceMode::Async)
+        .checksum_mode(ChecksumMode::Crc32c)
+        .async_io_backend(AsyncIoBackend::Blocking)
+        .create()
+        .unwrap();
+
+    let payload = vec![0x33; 256];
+    for sequence in 1..=2u64 {
+        recorder
+            .append_log_record(LogRecordInput {
+                sequence,
+                event_time_ns: sequence * 10,
+                user_header: &[0x10],
+                payload: &payload,
+            })
+            .unwrap();
+    }
+    recorder.flush().unwrap();
+
+    let snapshot = ArchiveReplayerBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .open()
+        .unwrap();
+    let mut live = ArchiveReplayerBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .open_live()
+        .unwrap();
+
+    assert_that!(
+        live.status().last_visible_sequence,
+        eq Some(2)
+    );
+    live.seek(0);
+    let initial = live.next_batch(NonZeroUsize::new(16).unwrap()).unwrap();
+    assert_that!(initial.len(), eq 2);
+
+    for sequence in 3..=5u64 {
+        recorder
+            .append_log_record(LogRecordInput {
+                sequence,
+                event_time_ns: sequence * 10,
+                user_header: &[0x20],
+                payload: &payload,
+            })
+            .unwrap();
+    }
+    recorder.flush().unwrap();
+
+    assert_that!(snapshot.read_at_sequence(3).unwrap().is_none(), eq true);
+    assert_that!(live.refresh().unwrap(), eq 3);
+    let status = live.status();
+    assert_that!(status.visible_records, eq 5);
+    assert_that!(status.last_visible_sequence, eq Some(5));
+    assert_that!(status.last_visible_commit_ordinal, eq 5);
+
+    let followed = live
+        .next_live_batch(
+            NonZeroUsize::new(16).unwrap(),
+            Duration::from_millis(1),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+    assert_that!(followed.len(), eq 3);
+    assert_that!(followed[0].sequence, eq 3);
+    assert_that!(followed[2].sequence, eq 5);
+
+    let empty = live
+        .next_live_batch(
+            NonZeroUsize::new(16).unwrap(),
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+    assert_that!(empty.is_empty(), eq true);
+
+    recorder.finalize().unwrap();
+}

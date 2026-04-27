@@ -21,4 +21,6 @@ mod storage;
 pub use common::*;
 pub use metadata::*;
 pub use recorder::ArchiveRecorderBuilder;
-pub use replayer::{ArchiveReplayer, ArchiveReplayerBuilder};
+pub use replayer::{
+    ArchiveLiveReplayer, ArchiveReplayer, ArchiveReplayerBuilder, LiveReplayStatus,
+};

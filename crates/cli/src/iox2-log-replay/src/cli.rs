@@ -116,6 +116,26 @@ pub struct ReplayOptions {
     )]
     pub max_errors: Option<usize>,
 
+    #[clap(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Refresh commit.idxlog and follow newly committed records."
+    )]
+    pub follow: bool,
+
+    #[clap(
+        long,
+        default_value = "100",
+        help = "Polling interval for --follow in milliseconds."
+    )]
+    pub follow_poll_ms: u64,
+
+    #[clap(
+        long,
+        help = "Stop --follow after this many milliseconds without a new visible record."
+    )]
+    pub follow_idle_timeout_ms: Option<u64>,
+
     #[clap(subcommand)]
     pub selector: ReplaySelector,
 }

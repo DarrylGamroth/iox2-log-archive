@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow};
 use iox2_log_archive_cli::Format;
 use iox2_log_archive_core::log_archive::{
-    ArchiveLocator, ArchiveReplayError, ArchiveReplayerBuilder, ReplayedFrame,
+    ArchiveLiveReplayer, ArchiveLocator, ArchiveReplayError, ArchiveReplayerBuilder, ReplayedFrame,
     decode_adapter_user_header,
 };
 use iox2_log_archive_iceoryx2::{
@@ -143,12 +143,17 @@ struct ReplaySummary {
     service: Option<String>,
     selector_source: String,
     rate_mode: &'static str,
+    live_mode: bool,
     selected: usize,
     emitted: usize,
     skipped_missing: usize,
     errors: usize,
     bytes_emitted: usize,
     elapsed_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_visible_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_visible_commit_ordinal: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +163,57 @@ struct ReplayCounters {
     skipped_missing: usize,
     errors: usize,
     bytes_emitted: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MissingPolicy {
+    skip_missing: bool,
+    max_errors: usize,
+}
+
+struct LiveReplayContext<'a> {
+    emitter: &'a mut ReplayEmitter,
+    pacer: &'a mut ReplayPacer,
+    counters: &'a mut ReplayCounters,
+    missing_policy: MissingPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FollowConfig {
+    poll_interval: Duration,
+    idle_timeout: Option<Duration>,
+}
+
+impl FollowConfig {
+    fn from_options(options: &ReplayOptions) -> Result<Self, LogReplayCommandError> {
+        if !options.follow {
+            if options.follow_idle_timeout_ms.is_some() {
+                return Err(LogReplayCommandError::InvalidInput(
+                    "--follow-idle-timeout-ms is only valid with --follow".to_string(),
+                ));
+            }
+            return Ok(Self {
+                poll_interval: Duration::from_millis(options.follow_poll_ms),
+                idle_timeout: None,
+            });
+        }
+
+        if options.follow_poll_ms == 0 {
+            return Err(LogReplayCommandError::InvalidInput(
+                "--follow-poll-ms must be > 0".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            poll_interval: Duration::from_millis(options.follow_poll_ms),
+            idle_timeout: options.follow_idle_timeout_ms.map(Duration::from_millis),
+        })
+    }
+
+    fn wait_timeout(self) -> Duration {
+        self.idle_timeout
+            .unwrap_or_else(|| Duration::from_secs(24 * 60 * 60))
+    }
 }
 
 impl ReplayCounters {
@@ -400,6 +456,17 @@ fn replay(options: ReplayOptions, format: Format) -> Result<(), LogReplayCommand
             ));
         }
     }
+    let follow_config = FollowConfig::from_options(&options)?;
+    if options.follow
+        && matches!(
+            &options.selector,
+            ReplaySelector::Locator(_) | ReplaySelector::Selectors(_)
+        )
+    {
+        return Err(LogReplayCommandError::InvalidInput(
+            "--follow supports all, sequence, and range selectors".to_string(),
+        ));
+    }
 
     let paths = ArchivePaths::from_options(&options);
     paths.ensure_archive_exists()?;
@@ -412,11 +479,6 @@ fn replay(options: ReplayOptions, format: Format) -> Result<(), LogReplayCommand
             .max_errors
             .unwrap_or(if options.skip_missing { usize::MAX } else { 1 });
 
-    let mut replayer = ArchiveReplayerBuilder::new(&paths.storage_path)
-        .metadata_log_path(&paths.metadata_log_path)
-        .open()
-        .map_err(map_replay_error)?;
-
     let selector_source = selector_source_label(&options.selector);
     let started = Instant::now();
     let mut counters = ReplayCounters {
@@ -426,64 +488,91 @@ fn replay(options: ReplayOptions, format: Format) -> Result<(), LogReplayCommand
         errors: 0,
         bytes_emitted: 0,
     };
-
-    match &options.selector {
-        ReplaySelector::All => {
-            replay_all(&mut replayer, &mut emitter, &mut pacer, &mut counters)?;
-        }
-        ReplaySelector::Sequence(SequenceSelector { at }) => {
-            replay_selector(
-                Selector::Sequence(*at),
-                &replayer,
-                &mut emitter,
-                &mut pacer,
-                &mut counters,
-                options.skip_missing,
-                max_errors,
-            )?;
-        }
-        ReplaySelector::Range(RangeSelector { from, count }) => {
-            if *count == 0 {
-                return Err(LogReplayCommandError::InvalidInput(
-                    "--count must be > 0".to_string(),
-                ));
-            }
-            replay_selector(
-                Selector::Range {
-                    from: *from,
-                    count: *count,
+    let live_status = if options.follow {
+        let mut live_replayer = ArchiveReplayerBuilder::new(&paths.storage_path)
+            .metadata_log_path(&paths.metadata_log_path)
+            .open_live()
+            .map_err(map_replay_error)?;
+        replay_live(
+            &options,
+            follow_config,
+            &mut live_replayer,
+            LiveReplayContext {
+                emitter: &mut emitter,
+                pacer: &mut pacer,
+                counters: &mut counters,
+                missing_policy: MissingPolicy {
+                    skip_missing: options.skip_missing,
+                    max_errors,
                 },
-                &replayer,
-                &mut emitter,
-                &mut pacer,
-                &mut counters,
-                options.skip_missing,
-                max_errors,
-            )?;
+            },
+        )?;
+        Some(live_replayer.status())
+    } else {
+        let mut replayer = ArchiveReplayerBuilder::new(&paths.storage_path)
+            .metadata_log_path(&paths.metadata_log_path)
+            .open()
+            .map_err(map_replay_error)?;
+
+        match &options.selector {
+            ReplaySelector::All => {
+                replay_all(&mut replayer, &mut emitter, &mut pacer, &mut counters)?;
+            }
+            ReplaySelector::Sequence(SequenceSelector { at }) => {
+                replay_selector(
+                    Selector::Sequence(*at),
+                    &replayer,
+                    &mut emitter,
+                    &mut pacer,
+                    &mut counters,
+                    options.skip_missing,
+                    max_errors,
+                )?;
+            }
+            ReplaySelector::Range(RangeSelector { from, count }) => {
+                if *count == 0 {
+                    return Err(LogReplayCommandError::InvalidInput(
+                        "--count must be > 0".to_string(),
+                    ));
+                }
+                replay_selector(
+                    Selector::Range {
+                        from: *from,
+                        count: *count,
+                    },
+                    &replayer,
+                    &mut emitter,
+                    &mut pacer,
+                    &mut counters,
+                    options.skip_missing,
+                    max_errors,
+                )?;
+            }
+            ReplaySelector::Locator(LocatorSelector { at }) => {
+                replay_selector(
+                    Selector::Locator(parse_locator(at)?),
+                    &replayer,
+                    &mut emitter,
+                    &mut pacer,
+                    &mut counters,
+                    options.skip_missing,
+                    max_errors,
+                )?;
+            }
+            ReplaySelector::Selectors(selector_options) => {
+                replay_selector_stream(
+                    selector_options,
+                    &replayer,
+                    &mut emitter,
+                    &mut pacer,
+                    &mut counters,
+                    options.skip_missing,
+                    max_errors,
+                )?;
+            }
         }
-        ReplaySelector::Locator(LocatorSelector { at }) => {
-            replay_selector(
-                Selector::Locator(parse_locator(at)?),
-                &replayer,
-                &mut emitter,
-                &mut pacer,
-                &mut counters,
-                options.skip_missing,
-                max_errors,
-            )?;
-        }
-        ReplaySelector::Selectors(selector_options) => {
-            replay_selector_stream(
-                selector_options,
-                &replayer,
-                &mut emitter,
-                &mut pacer,
-                &mut counters,
-                options.skip_missing,
-                max_errors,
-            )?;
-        }
-    }
+        None
+    };
 
     if counters.selected == 0 {
         return Err(LogReplayCommandError::InvalidInput(
@@ -499,12 +588,15 @@ fn replay(options: ReplayOptions, format: Format) -> Result<(), LogReplayCommand
         service: emitter.destination_service(),
         selector_source,
         rate_mode: rate_mode_label(options.rate),
+        live_mode: options.follow,
         selected: counters.selected,
         emitted: counters.emitted,
         skipped_missing: counters.skipped_missing,
         errors: counters.errors,
         bytes_emitted: counters.bytes_emitted,
         elapsed_ms: started.elapsed().as_millis(),
+        last_visible_sequence: live_status.and_then(|status| status.last_visible_sequence),
+        last_visible_commit_ordinal: live_status.map(|status| status.last_visible_commit_ordinal),
     };
 
     if matches!(emitter, ReplayEmitter::Stdout) {
@@ -534,6 +626,137 @@ fn replay_all(
     }
 
     Ok(())
+}
+
+fn replay_live(
+    options: &ReplayOptions,
+    follow_config: FollowConfig,
+    replayer: &mut ArchiveLiveReplayer,
+    mut context: LiveReplayContext<'_>,
+) -> Result<(), LogReplayCommandError> {
+    match &options.selector {
+        ReplaySelector::All => {
+            replay_live_all(replayer, follow_config, &mut context)?;
+        }
+        ReplaySelector::Sequence(SequenceSelector { at }) => {
+            replay_live_sequence(replayer, follow_config, *at, &mut context)?;
+        }
+        ReplaySelector::Range(RangeSelector { from, count }) => {
+            if *count == 0 {
+                return Err(LogReplayCommandError::InvalidInput(
+                    "--count must be > 0".to_string(),
+                ));
+            }
+            replay_live_range(replayer, follow_config, *from, *count, &mut context)?;
+        }
+        ReplaySelector::Locator(_) | ReplaySelector::Selectors(_) => {
+            return Err(LogReplayCommandError::InvalidInput(
+                "--follow supports all, sequence, and range selectors".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn replay_live_all(
+    replayer: &mut ArchiveLiveReplayer,
+    follow_config: FollowConfig,
+    context: &mut LiveReplayContext<'_>,
+) -> Result<(), LogReplayCommandError> {
+    replayer.seek(0);
+    let batch_size = NonZeroUsize::new(1024).expect("constant batch size is non-zero");
+    loop {
+        let batch = replayer
+            .next_live_batch(
+                batch_size,
+                follow_config.poll_interval,
+                follow_config.wait_timeout(),
+            )
+            .map_err(map_replay_error)?;
+        if batch.is_empty() {
+            break;
+        }
+        context.counters.selected = context.counters.selected.saturating_add(batch.len());
+        for frame in &batch {
+            emit_one(context.emitter, context.pacer, frame, context.counters)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn replay_live_sequence(
+    replayer: &mut ArchiveLiveReplayer,
+    follow_config: FollowConfig,
+    sequence: u64,
+    context: &mut LiveReplayContext<'_>,
+) -> Result<(), LogReplayCommandError> {
+    context.counters.selected = context.counters.selected.saturating_add(1);
+    let started = Instant::now();
+    loop {
+        replayer.refresh().map_err(map_replay_error)?;
+        if let Some(frame) = replayer
+            .read_at_sequence(sequence)
+            .map_err(map_replay_error)?
+        {
+            return emit_one(context.emitter, context.pacer, &frame, context.counters);
+        }
+        if follow_config
+            .idle_timeout
+            .is_some_and(|timeout| started.elapsed() >= timeout)
+        {
+            return context.counters.handle_missing(
+                1,
+                context.missing_policy.skip_missing,
+                context.missing_policy.max_errors,
+                &format!("sequence {sequence} is not available before follow idle timeout"),
+            );
+        }
+        std::thread::sleep(follow_config.poll_interval);
+    }
+}
+
+fn replay_live_range(
+    replayer: &mut ArchiveLiveReplayer,
+    follow_config: FollowConfig,
+    from: u64,
+    count: usize,
+    context: &mut LiveReplayContext<'_>,
+) -> Result<(), LogReplayCommandError> {
+    context.counters.selected = context.counters.selected.saturating_add(count);
+    replayer.seek(from);
+    let batch_size = NonZeroUsize::new(1024).expect("constant batch size is non-zero");
+    let mut remaining = count;
+    let mut emitted_for_range = 0usize;
+
+    while remaining > 0 {
+        let request = NonZeroUsize::new(remaining.min(batch_size.get()))
+            .expect("remaining is non-zero inside live range loop");
+        let batch = replayer
+            .next_live_batch(
+                request,
+                follow_config.poll_interval,
+                follow_config.wait_timeout(),
+            )
+            .map_err(map_replay_error)?;
+        if batch.is_empty() {
+            break;
+        }
+        for frame in &batch {
+            emit_one(context.emitter, context.pacer, frame, context.counters)?;
+        }
+        emitted_for_range = emitted_for_range.saturating_add(batch.len());
+        remaining = remaining.saturating_sub(batch.len());
+    }
+
+    let missing = count.saturating_sub(emitted_for_range);
+    context.counters.handle_missing(
+        missing,
+        context.missing_policy.skip_missing,
+        context.missing_policy.max_errors,
+        &format!("range from {from} count {count} resolved only {emitted_for_range} records"),
+    )
 }
 
 fn replay_selector(
@@ -1237,6 +1460,9 @@ mod tests {
             node_name: "test-node".to_string(),
             skip_missing: false,
             max_errors: None,
+            follow: false,
+            follow_poll_ms: 100,
+            follow_idle_timeout_ms: None,
             selector: ReplaySelector::All,
         }
     }
@@ -1308,6 +1534,45 @@ mod tests {
         let mut fixed = ReplayPacer::new(&fixed_options).unwrap();
         fixed.pace(&frame(1, 100));
         fixed.pace(&frame(2, 200));
+    }
+
+    #[test]
+    fn follow_config_validates_live_replay_options() {
+        let snapshot = replay_options(ReplayRateMode::Fast);
+        assert!(
+            FollowConfig::from_options(&snapshot)
+                .unwrap()
+                .idle_timeout
+                .is_none()
+        );
+
+        let mut timeout_without_follow = replay_options(ReplayRateMode::Fast);
+        timeout_without_follow.follow_idle_timeout_ms = Some(10);
+        assert!(
+            FollowConfig::from_options(&timeout_without_follow)
+                .unwrap_err()
+                .to_string()
+                .contains("only valid with --follow")
+        );
+
+        let mut zero_poll = replay_options(ReplayRateMode::Fast);
+        zero_poll.follow = true;
+        zero_poll.follow_poll_ms = 0;
+        assert!(
+            FollowConfig::from_options(&zero_poll)
+                .unwrap_err()
+                .to_string()
+                .contains("--follow-poll-ms must be > 0")
+        );
+
+        let mut live = replay_options(ReplayRateMode::Fast);
+        live.follow = true;
+        live.follow_poll_ms = 7;
+        live.follow_idle_timeout_ms = Some(11);
+        let config = FollowConfig::from_options(&live).unwrap();
+        assert_eq!(config.poll_interval, Duration::from_millis(7));
+        assert_eq!(config.idle_timeout, Some(Duration::from_millis(11)));
+        assert_eq!(config.wait_timeout(), Duration::from_millis(11));
     }
 
     #[test]

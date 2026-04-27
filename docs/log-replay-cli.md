@@ -59,6 +59,8 @@ appear in all capitals.
 - `LRC-008`: CLI errors and exit codes `MUST` be deterministic and machine-readable.
 - `LRC-009`: Replay summary `MUST` include emitted count, skipped count, byte count, and elapsed time.
 - `LRC-010`: For stdin selectors, parsing and replay `SHOULD` be incremental (streaming) to avoid loading all selectors into memory.
+- `LRC-011`: Snapshot replay MUST remain the default. Live replay MUST be explicit via follow mode.
+- `LRC-012`: Follow mode MUST refresh `commit.idxlog` and expose a visible sequence/commit watermark in the replay summary.
 
 ## CLI Contract
 
@@ -87,6 +89,14 @@ Design intent:
 - Selector commands are structurally exclusive by CLI shape (no flag-level exclusion matrix).
 - `all` replays every available record in archive sequence order.
 - `selectors` is the only mode that accepts external multi-record selector streams.
+
+### Live Follow Mode
+- `--follow` refreshes `commit.idxlog` while replay is active.
+- `--follow` is supported for `all`, `sequence`, and `range`.
+- `locator` and selector-stream replay remain snapshot operations.
+- `--follow-poll-ms <n>` controls polling interval.
+- `--follow-idle-timeout-ms <n>` exits after no new visible records appear for the configured duration.
+- Without an idle timeout, `all --follow` is intended to run until interrupted.
 
 ### Destinations
 - `--to publish-subscribe --service <name>`

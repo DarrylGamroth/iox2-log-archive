@@ -109,6 +109,24 @@ iox2-log-replay --format JSON replay \
   all
 ```
 
+For live replay while a recorder is active, use explicit follow mode. Snapshot
+replay remains the default so offline replay is deterministic.
+
+```bash
+iox2-log-replay --format JSON replay \
+  --storage-path /var/lib/iox2-log-archive/storage \
+  --metadata-log-path /var/lib/iox2-log-archive/metadata \
+  --to publish-subscribe \
+  --service My/Camera/Frames/Replay \
+  --follow \
+  --follow-poll-ms 100 \
+  all
+```
+
+Add `--follow-idle-timeout-ms <n>` for scripts that should exit after the live
+stream is quiet. Follow mode refreshes `commit.idxlog`; query freshness is still
+handled by `iox2-log-query index run` and its `query_watermark`.
+
 Future export-style tools should use the same selector stream boundary. For
 exports that need exact query membership, expand sequence ranges into locator
 selectors:
