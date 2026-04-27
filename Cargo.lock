@@ -858,6 +858,7 @@ dependencies = [
  "iox2-log-archive-iceoryx2",
  "iox2-log-archive-sqlite",
  "ron",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

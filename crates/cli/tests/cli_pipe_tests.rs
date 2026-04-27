@@ -189,6 +189,61 @@ fn create_archive(
     Ok(())
 }
 
+fn query_record(
+    log_id_byte: u8,
+    commit_ordinal: u64,
+    sequence: u64,
+    event_time_ns: u64,
+    commit_time_ns: u64,
+    file_offset: u64,
+) -> MetadataCommitRecord {
+    MetadataCommitRecord {
+        log_id: [log_id_byte; 16],
+        commit_ordinal,
+        sequence,
+        locator: ArchiveLocator {
+            segment_id: 1,
+            segment_generation: 1,
+            file_offset,
+            frame_len: 64,
+        },
+        frame_checksum: sequence as u32,
+        event_time_ns,
+        commit_time_ns,
+        source_pattern: ArchiveSourcePattern::PublishSubscribe,
+        source_service_id: log_id_byte as u64,
+        source_instance_id: 1,
+        source_sequence: Some(sequence),
+    }
+}
+
+fn seed_query_stream(
+    db_path: &Path,
+    stream_id: &str,
+    records: &[MetadataCommitRecord],
+    last_commit_ordinal: u64,
+    last_indexed_commit_ordinal: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut sink = SqliteMetadataSink::open_for_stream(db_path, stream_id)?;
+    if !records.is_empty() {
+        sink.on_records(records)?;
+    }
+    sink.upsert_indexer_state(&SqliteIndexerState {
+        stream_id: stream_id.to_string(),
+        log_id: records
+            .last()
+            .map(|record| record.log_id)
+            .unwrap_or([0u8; 16]),
+        last_commit_ordinal,
+        last_indexed_commit_ordinal,
+        roll_file: "commit.idxlog".to_string(),
+        byte_offset: 0,
+        updated_at_ns: 1,
+        schema_version: SQLITE_SCHEMA_VERSION,
+    })?;
+    Ok(())
+}
+
 fn index_archive(
     metadata_path: &Path,
     db_path: &Path,
@@ -1016,6 +1071,238 @@ fn query_commands_cover_status_locators_windows_and_alignment()
 }
 
 #[test]
+fn query_commands_cover_emit_modes_time_fields_and_grid_alignment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let db_path = temp.path().join("query.sqlite");
+    let db = db_path.to_str().expect("utf-8 db path");
+
+    seed_query_stream(
+        &db_path,
+        "cam-a",
+        &[
+            query_record(0xA0, 1, 1, 1_000, 1_500, 64),
+            query_record(0xA0, 2, 2, 3_000, 3_500, 128),
+        ],
+        2,
+        2,
+    )?;
+    seed_query_stream(
+        &db_path,
+        "cam-b",
+        &[
+            query_record(0xB0, 1, 1, 2_000, 2_500, 192),
+            query_record(0xB0, 2, 2, 4_000, 4_500, 256),
+        ],
+        2,
+        2,
+    )?;
+
+    let query_bin = env!("CARGO_BIN_EXE_iox2-log-query");
+
+    let compact_range = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-range",
+            "--db-path",
+            db,
+            "--stream-id",
+            "cam-a",
+            "--from",
+            "1",
+            "--count",
+            "2",
+            "--emit",
+            "selectors",
+        ])
+        .output()?;
+    assert_success(&compact_range, "locate-range compact selector");
+    let compact: serde_json::Value = serde_json::from_slice(&compact_range.stdout)?;
+    assert_eq!(compact["kind"], "range");
+    assert_eq!(compact["count"], 2);
+
+    let range_summary = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-range",
+            "--db-path",
+            db,
+            "--stream-id",
+            "cam-a",
+            "--from",
+            "1",
+            "--count",
+            "2",
+            "--emit",
+            "summary",
+        ])
+        .output()?;
+    assert_success(&range_summary, "locate-range summary");
+    let range_summary: serde_json::Value = serde_json::from_slice(&range_summary.stdout)?;
+    assert_eq!(range_summary["operation"], "locate-range");
+    assert_eq!(range_summary["rows"], 2);
+
+    let utc_window = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-window",
+            "--db-path",
+            db,
+            "--stream-id",
+            "cam-a",
+            "--start-utc",
+            "1970-01-01T00:00:00.000001Z",
+            "--end-utc",
+            "1970-01-01T00:00:00.000003Z",
+            "--emit",
+            "selectors",
+        ])
+        .output()?;
+    assert_success(&utc_window, "locate-window UTC selectors");
+    assert_eq!(
+        String::from_utf8_lossy(&utc_window.stdout).lines().count(),
+        2
+    );
+
+    let commit_window = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-window",
+            "--db-path",
+            db,
+            "--stream-id",
+            "cam-a",
+            "--start-ns",
+            "1500",
+            "--end-ns",
+            "3500",
+            "--time-field",
+            "commit",
+            "--emit",
+            "summary",
+        ])
+        .output()?;
+    assert_success(&commit_window, "locate-window commit summary");
+    let commit_window: serde_json::Value = serde_json::from_slice(&commit_window.stdout)?;
+    assert_eq!(commit_window["rows"], 2);
+
+    let align_aligned = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "align-window",
+            "--db-path",
+            db,
+            "--streams",
+            "cam-a,cam-b",
+            "--start-ns",
+            "1000",
+            "--end-ns",
+            "4000",
+            "--mode",
+            "grid",
+            "--step-ns",
+            "1000",
+            "--fill-policy",
+            "nearest",
+            "--max-skew-ns",
+            "600",
+            "--emit",
+            "aligned",
+            "--include-provenance",
+        ])
+        .output()?;
+    assert_success(&align_aligned, "align-window grid aligned");
+    let aligned_rows = String::from_utf8_lossy(&align_aligned.stdout)
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(aligned_rows.len(), 4);
+    assert_eq!(aligned_rows[0]["streams"]["cam-a"]["status"], "exact");
+    assert_eq!(aligned_rows[0]["streams"]["cam-b"]["status"], "missing");
+    assert!(aligned_rows[0]["streams"]["cam-a"]["provenance"].is_object());
+
+    let align_selectors = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "align-window",
+            "--db-path",
+            db,
+            "--streams",
+            "cam-a,cam-b",
+            "--start-ns",
+            "2000",
+            "--end-ns",
+            "4000",
+            "--mode",
+            "anchor",
+            "--anchor-stream",
+            "cam-b",
+            "--fill-policy",
+            "nearest",
+            "--max-skew-ns",
+            "1100",
+            "--emit",
+            "selectors",
+            "--require-all-streams",
+        ])
+        .output()?;
+    assert_success(&align_selectors, "align-window selector rows");
+    assert_eq!(
+        String::from_utf8_lossy(&align_selectors.stdout)
+            .lines()
+            .count(),
+        2
+    );
+
+    let align_summary = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "align-window",
+            "--db-path",
+            db,
+            "--streams",
+            "cam-a",
+            "--start-ns",
+            "1500",
+            "--end-ns",
+            "3500",
+            "--time-field",
+            "commit",
+            "--mode",
+            "grid",
+            "--step-ns",
+            "1000",
+            "--fill-policy",
+            "nearest",
+            "--max-skew-ns",
+            "600",
+            "--emit",
+            "summary",
+        ])
+        .output()?;
+    assert_success(&align_summary, "align-window grid commit summary");
+    let align_summary: serde_json::Value = serde_json::from_slice(&align_summary.stdout)?;
+    assert_eq!(align_summary["mode"], "grid");
+    assert_eq!(align_summary["time_field"], "commit");
+
+    Ok(())
+}
+
+#[test]
 fn query_commands_cover_reindex_latest_filtered_status_and_not_indexed()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
@@ -1354,6 +1641,294 @@ fn query_commands_report_invalid_inputs() -> Result<(), Box<dyn std::error::Erro
         ])
         .output()?;
     assert_failure_contains(&missing, "query database not found", "query missing db");
+
+    Ok(())
+}
+
+#[test]
+fn query_commands_cover_missing_ranges_locators_and_schema_reset()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    let db_path = temp.path().join("query.sqlite");
+    let db = db_path.to_str().expect("utf-8 db path");
+    create_archive(&storage_path, &metadata_path)?;
+
+    seed_query_stream(
+        &db_path,
+        "cam-a",
+        &[
+            query_record(0xA0, 1, 1, 1_000, 1_500, 64),
+            query_record(0xA0, 2, 3, 3_000, 3_500, 192),
+        ],
+        2,
+        2,
+    )?;
+    seed_query_stream(
+        &db_path,
+        "cam-partial",
+        &[query_record(0xB0, 1, 1, 1_000, 1_500, 320)],
+        4,
+        1,
+    )?;
+
+    let query_bin = env!("CARGO_BIN_EXE_iox2-log-query");
+
+    for (args, expected, context) in [
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-range",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-a",
+                "--from",
+                "1",
+                "--count",
+                "2",
+            ],
+            "sequence range from 1",
+            "locate-range missing indexed row",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-range",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-partial",
+                "--from",
+                "1",
+                "--count",
+                "4",
+            ],
+            "\"NotIndexedYet\"",
+            "locate-range not indexed yet",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-locator",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-a",
+                "--at",
+                "1:1:999:64",
+            ],
+            "locator 1:1:999:64 is not available",
+            "locate-locator missing indexed locator",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-locator",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-partial",
+                "--at",
+                "1:1:999:64",
+            ],
+            "\"NotIndexedYet\"",
+            "locate-locator not indexed yet",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-window",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-partial",
+                "--start-ns",
+                "1000",
+                "--end-ns",
+                "5000",
+            ],
+            "\"NotIndexedYet\"",
+            "locate-window not indexed yet",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-range",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-a",
+                "--from",
+                "1",
+                "--count",
+                "1",
+                "--emit",
+                "summary",
+                "--expand-selectors",
+            ],
+            "--expand-selectors is only valid with --emit selectors",
+            "locate-range invalid expanded summary",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-range",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-a",
+                "--from",
+                "1",
+                "--count",
+                "100001",
+            ],
+            "--count must be <=",
+            "locate-range too large",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-window",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-a",
+                "--start-ns",
+                "1",
+                "--end-ns",
+                "2",
+                "--emit",
+                "aligned",
+            ],
+            "--emit aligned is not supported by locate-window",
+            "locate-window aligned invalid",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "align-window",
+                "--db-path",
+                db,
+                "--streams",
+                "cam-a",
+                "--start-ns",
+                "1",
+                "--end-ns",
+                "2",
+                "--mode",
+                "anchor",
+            ],
+            "--anchor-stream is required with --mode anchor",
+            "align-window missing anchor stream",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "align-window",
+                "--db-path",
+                db,
+                "--streams",
+                "cam-a",
+                "--start-ns",
+                "1",
+                "--end-ns",
+                "2",
+                "--mode",
+                "grid",
+                "--step-ns",
+                "0",
+            ],
+            "--step-ns must be > 0",
+            "align-window zero step",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "align-window",
+                "--db-path",
+                db,
+                "--streams",
+                "cam-a",
+                "--start-ns",
+                "1",
+                "--end-ns",
+                "2",
+                "--mode",
+                "grid",
+                "--step-ns",
+                "1",
+                "--limit",
+                "0",
+            ],
+            "--limit must be in",
+            "align-window zero limit",
+        ),
+    ] {
+        let output = Command::new(query_bin).args(args).output()?;
+        assert_failure_contains(&output, expected, context);
+    }
+
+    let malformed_db = temp.path().join("missing-migrations.sqlite");
+    let connection = rusqlite::Connection::open(&malformed_db)?;
+    connection.execute_batch("CREATE TABLE indexer_state (stream_id TEXT PRIMARY KEY);")?;
+    drop(connection);
+
+    let malformed_status = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "status",
+            "--db-path",
+            malformed_db.to_str().expect("utf-8 malformed db path"),
+        ])
+        .output()?;
+    assert_failure_contains(
+        &malformed_status,
+        "schema migration metadata",
+        "query malformed schema status",
+    );
+
+    let reset = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "index",
+            "catch-up",
+            "--stream-id",
+            "cam-reset",
+            "--metadata-log-path",
+            metadata_path.to_str().expect("utf-8 metadata path"),
+            "--db-path",
+            malformed_db.to_str().expect("utf-8 malformed db path"),
+            "--reindex",
+        ])
+        .output()?;
+    assert_success(&reset, "query reindex resets malformed schema");
+    assert!(String::from_utf8_lossy(&reset.stdout).contains("\"last_indexed_commit_ordinal\": 4"));
 
     Ok(())
 }

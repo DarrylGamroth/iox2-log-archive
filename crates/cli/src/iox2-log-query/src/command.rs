@@ -1821,6 +1821,7 @@ mod tests {
 
         let busy = LogQueryCommandError::ResourceBusy("locked".to_string());
         assert_eq!(busy.exit_code(), 3);
+        assert_eq!(busy.to_string(), "locked");
         assert!(
             busy.to_formatted_error(Format::Json)
                 .contains("\"ResourceBusy\"")
@@ -1828,6 +1829,7 @@ mod tests {
 
         let internal = LogQueryCommandError::Internal(anyhow!("boom"));
         assert_eq!(internal.exit_code(), 1);
+        assert_eq!(internal.to_string(), "boom");
         assert!(
             internal
                 .to_formatted_error(Format::Json)
@@ -1873,6 +1875,12 @@ mod tests {
                 .to_string()
                 .contains("invalid locator")
         );
+        assert!(
+            parse_locator("1:2:3:4:5")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid locator")
+        );
 
         assert_eq!(
             resolve_time_window(Some(10), Some(20), None, None).unwrap(),
@@ -1909,6 +1917,27 @@ mod tests {
             .to_string()
             .contains("negative epoch")
         );
+        assert!(
+            resolve_time_window(
+                None,
+                None,
+                Some("not-a-timestamp"),
+                Some("1970-01-01T00:00:00Z"),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid RFC3339 timestamp")
+        );
+
+        assert!(matches!(
+            sqlite_time_field(TimeField::Commit),
+            SqliteTimeField::Commit
+        ));
+        let commit_record = metadata_record(7, 100);
+        assert_eq!(record_timestamp(commit_record, TimeField::Commit), 110);
+        assert_eq!(parse_rolled_commit_log_index("commit-42.idxlog"), Some(42));
+        assert_eq!(parse_rolled_commit_log_index("commit-.idxlog"), None);
+        assert_eq!(parse_rolled_commit_log_index("commit-active.idxlog"), None);
     }
 
     #[test]
@@ -1978,6 +2007,21 @@ mod tests {
         assert!(matches!(nearest.status, MatchStatus::Nearest));
         assert_eq!(nearest.delta_ns, Some(50));
 
+        let nearest_left = find_match(&stream_data["A"], 200, FillPolicy::Nearest, 100);
+        assert!(matches!(nearest_left.status, MatchStatus::Nearest));
+        assert_eq!(nearest_left.delta_ns, Some(-100));
+
+        let nearest_before_first = find_match(&stream_data["A"], 50, FillPolicy::Nearest, 100);
+        assert!(matches!(nearest_before_first.status, MatchStatus::Nearest));
+        assert_eq!(nearest_before_first.delta_ns, Some(50));
+
+        let nearest_after_last = find_match(&stream_data["A"], 350, FillPolicy::Nearest, 100);
+        assert!(matches!(nearest_after_last.status, MatchStatus::Nearest));
+        assert_eq!(nearest_after_last.delta_ns, Some(-50));
+
+        let nearest_outside_skew = find_match(&stream_data["A"], 500, FillPolicy::Nearest, 25);
+        assert!(matches!(nearest_outside_skew.status, MatchStatus::Missing));
+
         let missing = find_match(&stream_data["A"], 250, FillPolicy::Drop, 75);
         assert!(matches!(missing.status, MatchStatus::Missing));
 
@@ -1995,6 +2039,13 @@ mod tests {
         assert!(row.streams["A"].provenance.is_some());
         assert_eq!(row.streams["B"].status, "missing");
 
+        let commit_context = AlignBuildContext {
+            time_field: TimeField::Commit,
+            ..context
+        };
+        let commit_row = build_aligned_row(110, &commit_context, false).unwrap();
+        assert_eq!(commit_row.time_field, "commit");
+
         let selector_row = build_align_selector_row(100, &context).unwrap();
         assert!(selector_row.streams["A"].is_some());
         assert!(selector_row.streams["B"].is_none());
@@ -2005,6 +2056,106 @@ mod tests {
         };
         assert!(build_aligned_row(100, &drop_context, false).is_none());
         assert!(build_align_selector_row(100, &drop_context).is_none());
+
+        assert!(
+            build_timeline(TimelineRequest {
+                stream_data: &stream_data,
+                streams: &streams,
+                mode: AlignMode::Anchor,
+                anchor_stream: None,
+                step_ns: None,
+                start_ns: 0,
+                end_ns: 10,
+                limit: 10,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("--anchor-stream is required")
+        );
+        assert!(
+            build_timeline(TimelineRequest {
+                stream_data: &stream_data,
+                streams: &streams,
+                mode: AlignMode::Anchor,
+                anchor_stream: Some("missing"),
+                step_ns: None,
+                start_ns: 0,
+                end_ns: 10,
+                limit: 10,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("--anchor-stream must be part")
+        );
+        assert!(
+            build_timeline(TimelineRequest {
+                stream_data: &stream_data,
+                streams: &streams,
+                mode: AlignMode::Anchor,
+                anchor_stream: Some("A"),
+                step_ns: None,
+                start_ns: 0,
+                end_ns: 10,
+                limit: 1,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("aligned row cap exceeded")
+        );
+        assert!(
+            build_timeline(TimelineRequest {
+                stream_data: &stream_data,
+                streams: &streams,
+                mode: AlignMode::Grid,
+                anchor_stream: None,
+                step_ns: Some(1),
+                start_ns: 0,
+                end_ns: 2,
+                limit: 2,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("aligned row cap exceeded")
+        );
+    }
+
+    #[test]
+    fn query_helper_edges_cover_range_watermark_and_sink_error_mapping() {
+        let records = vec![metadata_record(1, 100), metadata_record(3, 300)];
+        assert!(!range_is_complete(1, 3, &records));
+        assert!(!range_is_complete(1, 2, &records));
+
+        let complete_state = SqliteIndexerState {
+            stream_id: "cam".to_string(),
+            log_id: [0u8; 16],
+            last_commit_ordinal: 4,
+            last_indexed_commit_ordinal: 4,
+            roll_file: "commit.idxlog".to_string(),
+            byte_offset: 0,
+            updated_at_ns: 0,
+            schema_version: SQLITE_SCHEMA_VERSION,
+        };
+        assert!(!is_sequence_not_indexed_yet(5, None, &complete_state));
+
+        let partial_state = SqliteIndexerState {
+            last_indexed_commit_ordinal: 1,
+            ..complete_state
+        };
+        assert!(is_sequence_not_indexed_yet(1, None, &partial_state));
+        assert!(!is_sequence_not_indexed_yet(1, Some(1), &partial_state));
+        assert!(is_sequence_not_indexed_yet(2, Some(1), &partial_state));
+
+        let busy = map_sink_error(
+            iox2_log_archive_core::log_archive::ArchiveMetadataSinkError::new(
+                "writer lock is already held for query.sqlite",
+            ),
+        );
+        assert!(matches!(busy, LogQueryCommandError::ResourceBusy(_)));
+
+        let internal = map_sink_error(
+            iox2_log_archive_core::log_archive::ArchiveMetadataSinkError::new("other sqlite error"),
+        );
+        assert!(matches!(internal, LogQueryCommandError::Internal(_)));
     }
 
     #[test]
