@@ -510,6 +510,88 @@ fn replay_follow_streams_records_committed_after_startup() -> Result<(), Box<dyn
 }
 
 #[test]
+fn replay_follow_supports_sequence_range_and_rejects_fixed_selectors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    create_archive(&storage_path, &metadata_path)?;
+
+    let replay_bin = env!("CARGO_BIN_EXE_iox2-log-replay");
+    let mut base = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "replay".to_string(),
+    ];
+    base.extend(replay_archive_args(&storage_path, &metadata_path));
+    base.extend([
+        "--to".to_string(),
+        "stdout".to_string(),
+        "--follow".to_string(),
+        "--follow-poll-ms".to_string(),
+        "10".to_string(),
+        "--follow-idle-timeout-ms".to_string(),
+        "50".to_string(),
+    ]);
+
+    let mut sequence_args = base.clone();
+    sequence_args.extend(["sequence".to_string(), "--at".to_string(), "2".to_string()]);
+    let output = Command::new(replay_bin).args(sequence_args).output()?;
+    assert_success(&output, "replay follow sequence");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"live_mode\": true"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"last_visible_sequence\": 4"));
+
+    let mut range_args = base.clone();
+    range_args.extend([
+        "range".to_string(),
+        "--from".to_string(),
+        "2".to_string(),
+        "--count".to_string(),
+        "2".to_string(),
+    ]);
+    let output = Command::new(replay_bin).args(range_args).output()?;
+    assert_success(&output, "replay follow range");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 2);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"emitted\": 2"));
+
+    let mut locator_args = base.clone();
+    locator_args.extend([
+        "locator".to_string(),
+        "--at".to_string(),
+        "1:1:0:64".to_string(),
+    ]);
+    let output = Command::new(replay_bin).args(locator_args).output()?;
+    assert_failure_contains(
+        &output,
+        "--follow supports all, sequence, and range selectors",
+        "follow locator rejection",
+    );
+
+    let selector_path = temp.path().join("selectors.ndjson");
+    std::fs::write(&selector_path, "{\"kind\":\"sequence\",\"sequence\":1}\n")?;
+    let mut selectors_args = base;
+    selectors_args.extend([
+        "selectors".to_string(),
+        "--file".to_string(),
+        selector_path
+            .to_str()
+            .expect("utf-8 selector path")
+            .to_string(),
+        "--selector-format".to_string(),
+        "ndjson".to_string(),
+    ]);
+    let output = Command::new(replay_bin).args(selectors_args).output()?;
+    assert_failure_contains(
+        &output,
+        "--follow supports all, sequence, and range selectors",
+        "follow selectors rejection",
+    );
+
+    Ok(())
+}
+
+#[test]
 fn recorder_help_exposes_general_throughput_profile_only() -> Result<(), Box<dyn std::error::Error>>
 {
     let help = Command::new(env!("CARGO_BIN_EXE_iox2-log-recorder"))

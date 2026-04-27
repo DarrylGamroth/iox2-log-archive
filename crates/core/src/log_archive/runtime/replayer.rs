@@ -74,6 +74,7 @@ impl ArchiveReplayerBuilder {
     pub fn open_live(self) -> Result<ArchiveLiveReplayer, ArchiveReplayError> {
         Ok(ArchiveLiveReplayer {
             replayer: self.open_snapshot()?,
+            live_pin: None,
         })
     }
 
@@ -638,6 +639,7 @@ pub struct LiveReplayStatus {
 #[derive(Debug)]
 pub struct ArchiveLiveReplayer {
     replayer: ArchiveReplayer,
+    live_pin: Option<ReplayPin>,
 }
 
 impl ArchiveLiveReplayer {
@@ -658,12 +660,15 @@ impl ArchiveLiveReplayer {
 
     /// Refreshes commit-log visibility and returns the count of newly visible records.
     pub fn refresh(&mut self) -> Result<usize, ArchiveReplayError> {
-        self.replayer.refresh_snapshot()
+        let new_records = self.replayer.refresh_snapshot()?;
+        self.refresh_live_pin()?;
+        Ok(new_records)
     }
 
     /// Positions live cursor to the first visible sequence `>= sequence`.
     pub fn seek(&mut self, sequence: u64) {
         self.replayer.seek(sequence);
+        let _ = self.refresh_live_pin();
     }
 
     /// Reads a visible record by archive sequence.
@@ -712,6 +717,46 @@ impl ArchiveLiveReplayer {
             let remaining = timeout.saturating_sub(started.elapsed());
             thread::sleep(poll_interval.min(remaining));
         }
+    }
+
+    fn refresh_live_pin(&mut self) -> Result<(), ArchiveReplayError> {
+        let Some(sequence_start) = self
+            .replayer
+            .ordered_sequences
+            .get(self.replayer.cursor)
+            .copied()
+        else {
+            self.release_live_pin()?;
+            return Ok(());
+        };
+        let Some(sequence_end) = self.replayer.ordered_sequences.last().copied() else {
+            self.release_live_pin()?;
+            return Ok(());
+        };
+
+        if self.live_pin.is_some_and(|pin| {
+            pin.sequence_start == sequence_start && pin.sequence_end == sequence_end
+        }) {
+            return Ok(());
+        }
+
+        let next_pin = self.replayer.begin_pin(sequence_start, sequence_end)?;
+        self.release_live_pin()?;
+        self.live_pin = Some(next_pin);
+        Ok(())
+    }
+
+    fn release_live_pin(&mut self) -> Result<(), ArchiveReplayError> {
+        let Some(pin) = self.live_pin.take() else {
+            return Ok(());
+        };
+        self.replayer.release_snapshot(pin)
+    }
+}
+
+impl Drop for ArchiveLiveReplayer {
+    fn drop(&mut self) {
+        let _ = self.release_live_pin();
     }
 }
 

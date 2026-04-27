@@ -1957,6 +1957,37 @@ fn log_archive_trim_respects_replay_snapshot_pins() {
 }
 
 #[test]
+fn log_archive_live_replayer_pins_visible_window_until_drop() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+
+    let mut recorder = write_rolled_archive(&storage_path, &metadata_path, None, 5);
+    {
+        let mut live_replayer = ArchiveReplayerBuilder::new(&storage_path)
+            .metadata_log_path(&metadata_path)
+            .open_live()
+            .unwrap();
+        assert_that!(live_replayer.refresh().unwrap(), eq 0);
+
+        let pinned_before_trim = recorder
+            .list_segments()
+            .unwrap()
+            .iter()
+            .all(|segment| segment.pinned);
+        assert_that!(pinned_before_trim, eq true);
+
+        let trimmed_with_live_pin = recorder.trim_before_sequence(u64::MAX).unwrap();
+        assert_that!(trimmed_with_live_pin, eq 0);
+        assert_that!(recorder.list_segments().unwrap().is_empty(), eq false);
+    }
+
+    let trimmed_after_drop = recorder.trim_before_sequence(u64::MAX).unwrap();
+    assert_that!(trimmed_after_drop > 0, eq true);
+    assert_that!(recorder.list_segments().unwrap().is_empty(), eq true);
+}
+
+#[test]
 fn log_archive_replayer_reports_invalid_pin_requests() {
     let temp = tempfile::tempdir().unwrap();
     let empty_storage_path = temp.path().join("empty-archive");

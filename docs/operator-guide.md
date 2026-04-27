@@ -127,6 +127,15 @@ Add `--follow-idle-timeout-ms <n>` for scripts that should exit after the live
 stream is quiet. Follow mode refreshes `commit.idxlog`; query freshness is still
 handled by `iox2-log-query index run` and its `query_watermark`.
 
+Live replay visibility is bounded by committed archive metadata. In async
+recording mode, an accepted sample can briefly exist only in recorder memory or
+pending I/O; another process should expect to see it only after the recorder has
+advanced/flushed the segment and `commit.idxlog` state. Use recorder/control
+flush or durable acknowledgment paths when an operator workflow requires the
+latest sample to be externally replayable immediately. While follow mode is
+active, it creates replay pins for the visible unread window so retention trim
+does not remove records underneath the live replay cursor.
+
 Future export-style tools should use the same selector stream boundary. For
 exports that need exact query membership, expand sequence ranges into locator
 selectors:

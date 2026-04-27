@@ -97,6 +97,8 @@ Design intent:
 - `--follow-poll-ms <n>` controls polling interval.
 - `--follow-idle-timeout-ms <n>` exits after no new visible records appear for the configured duration.
 - Without an idle timeout, `all --follow` is intended to run until interrupted.
+- Follow mode MUST pin the visible unread replay window so retention cannot trim records under the live cursor.
+- Follow mode visibility is bounded by complete committed archive metadata, not by recorder in-memory acceptance.
 
 ### Destinations
 - `--to publish-subscribe --service <name>`

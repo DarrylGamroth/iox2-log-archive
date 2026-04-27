@@ -335,6 +335,10 @@ Replay rate options:
 | `--follow-poll-ms <n>` | Poll interval for `--follow`; default `100`. |
 | `--follow-idle-timeout-ms <n>` | Stop `--follow` after this many milliseconds without new visible records. |
 
+Follow mode sees records after complete archive metadata is externally visible.
+It also pins the visible unread replay window so retention trim does not remove
+records under the live replay cursor.
+
 ## Tool Boundaries
 
 Use this split for production workflows:
