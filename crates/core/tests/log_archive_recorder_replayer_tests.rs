@@ -23,8 +23,9 @@ use iox2_log_archive_core::log_archive::{
     ArchiveRecorderError, ArchiveReplayError, ArchiveReplayerBuilder, ArchiveSegmentTier,
     ArchiveSourcePattern, AsyncIoBackend, ChecksumMode, DEFAULT_ACK_POLL_INTERVAL,
     DEFAULT_WAIT_DURABLE_DATA_AND_COMMIT_LOG_TIMEOUT, DEFAULT_WAIT_DURABLE_DATA_TIMEOUT,
-    EffectiveAsyncIoBackend, PersistenceMode, PublishSubscribeRecordInput, RecorderAckLevel,
-    ReplayBudget, ReplayFrameBuffer, decode_adapter_user_header,
+    EffectiveAsyncIoBackend, PersistenceMode, PublishSubscribeExternalPayloadInput,
+    PublishSubscribeRecordInput, RecorderAckLevel, ReplayBudget, ReplayFrameBuffer,
+    decode_adapter_user_header,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -281,6 +282,90 @@ fn log_archive_publish_subscribe_adapter_preserves_source_metadata_and_payload()
     assert_that!(second_decoded.source_metadata.source_sequence, eq Some(777));
     assert_eq!(second_decoded.user_header, &[0x22, 0x23, 0x24]);
     assert_eq!(second_frame.payload, vec![0xCD; 16]);
+}
+
+#[test]
+fn log_archive_external_payload_fast_path_persists_and_verifies_checksums() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+
+    let mut recorder = ArchiveRecorderBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .segment_bytes(4096)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .persistence_mode(PersistenceMode::Async)
+        .async_io_backend(AsyncIoBackend::Blocking)
+        .checksum_mode(ChecksumMode::Crc32c)
+        .create()
+        .unwrap();
+
+    let payload_owner = Box::new((0..64).map(|value| value as u8).collect::<Vec<_>>());
+    let payload_ptr = payload_owner.as_ptr();
+    let payload_len = payload_owner.len();
+    let commit = unsafe {
+        recorder.append_publish_subscribe_external_payload_record(
+            PublishSubscribeExternalPayloadInput {
+                event_time_ns: 1234,
+                source_service_id: 0xCAFE,
+                source_publisher_id: 0xBEEF,
+                source_sequence: Some(42),
+                user_header: &[0xA0, 0xA1, 0xA2],
+                payload_ptr,
+                payload_len,
+                payload_owner,
+            },
+        )
+    }
+    .unwrap();
+    recorder.finalize().unwrap();
+
+    let replayer = ArchiveReplayerBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .open()
+        .unwrap();
+    let frame = replayer.read_at_sequence(commit.sequence).unwrap().unwrap();
+    assert_that!(frame.sequence, eq 1);
+    assert_that!(
+        frame.payload,
+        eq(0..64).map(|value| value as u8).collect::<Vec<_>>()
+    );
+    assert_that!(frame.frame_checksum == 0, eq false);
+    let decoded = decode_adapter_user_header(&frame.user_header).unwrap();
+    assert_eq!(decoded.user_header, &[0xA0, 0xA1, 0xA2]);
+    assert_that!(
+        decoded.source_metadata.source_pattern,
+        eq ArchiveSourcePattern::PublishSubscribe
+    );
+    assert_that!(decoded.source_metadata.source_service_id, eq 0xCAFE);
+    assert_that!(decoded.source_metadata.source_instance_id, eq 0xBEEF);
+    assert_that!(decoded.source_metadata.source_sequence, eq Some(42));
+
+    let segment_path = storage_path.join(format!(
+        "segments/segment-{}-g{}.data",
+        commit.locator.segment_id, commit.locator.segment_generation
+    ));
+    let mut segment = OpenOptions::new().write(true).open(&segment_path).unwrap();
+    segment
+        .seek(SeekFrom::Start(
+            commit.locator.file_offset + u64::from(commit.locator.frame_len) - 1,
+        ))
+        .unwrap();
+    segment.write_all(&[0xFF]).unwrap();
+    segment.flush().unwrap();
+
+    let corrupt_replayer = ArchiveReplayerBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .open()
+        .unwrap();
+    let error = corrupt_replayer
+        .read_at_sequence(commit.sequence)
+        .unwrap_err();
+    assert_that!(
+        matches!(error, ArchiveReplayError::ChecksumMismatch { .. }),
+        eq true
+    );
 }
 
 #[test]

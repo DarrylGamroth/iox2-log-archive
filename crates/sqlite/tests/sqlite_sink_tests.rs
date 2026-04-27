@@ -161,6 +161,91 @@ fn sqlite_stream_isolation_and_state_roundtrip_work() {
 }
 
 #[test]
+fn sqlite_queries_cover_locators_windows_limits_and_empty_results() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("query.sqlite");
+
+    let mut sink_a = SqliteMetadataSink::open_for_stream(&db_path, "Cam/A").unwrap();
+    let mut sink_b = SqliteMetadataSink::open_for_stream(&db_path, "Cam/B").unwrap();
+
+    let records_a = (1..=5)
+        .map(|sequence| metadata_record(sequence, sequence))
+        .collect::<Vec<_>>();
+    let records_b = vec![metadata_record(1, 10), metadata_record(2, 11)];
+    sink_a.on_records(&records_a).unwrap();
+    sink_b.on_records(&records_b).unwrap();
+
+    let locator = records_a[2].locator;
+    let by_locator_a = sink_a.query_by_locator(locator).unwrap().unwrap();
+    assert_eq!(by_locator_a.sequence, 3);
+    assert_eq!(by_locator_a.commit_ordinal, 3);
+    let by_locator_b = sink_b.query_by_locator(locator).unwrap();
+    assert!(by_locator_b.is_none());
+
+    let range = sink_a.query_range_by_sequence(2, 3).unwrap();
+    assert_eq!(
+        range
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+
+    let event_window = sink_a
+        .query_window(200, 500, SqliteTimeField::Event, 2)
+        .unwrap();
+    assert_eq!(
+        event_window
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+
+    let commit_window = sink_a
+        .query_window(210, 410, SqliteTimeField::Commit, 10)
+        .unwrap();
+    assert_eq!(
+        commit_window
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+
+    let empty = sink_a
+        .query_window(9_000, 10_000, SqliteTimeField::Event, 10)
+        .unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(
+        sink_a.max_timestamp_ns(SqliteTimeField::Event).unwrap(),
+        Some(500)
+    );
+    assert_eq!(
+        sink_a.max_timestamp_ns(SqliteTimeField::Commit).unwrap(),
+        Some(510)
+    );
+    assert_eq!(sink_a.latest_record().unwrap().unwrap().sequence, 5);
+    assert_eq!(sink_b.record_count().unwrap(), 2);
+}
+
+#[test]
+fn sqlite_queries_reject_values_outside_sqlite_integer_range() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("query.sqlite");
+    let sink = SqliteMetadataSink::open_for_stream(&db_path, "Cam/A").unwrap();
+
+    let too_large = (i64::MAX as u64) + 1;
+    let sequence_error = sink.query_by_sequence(too_large).unwrap_err();
+    assert!(sequence_error.details.contains("sequence"));
+
+    let window_error = sink
+        .query_window(too_large, too_large, SqliteTimeField::Event, 10)
+        .unwrap_err();
+    assert!(window_error.details.contains("start_ns"));
+}
+
+#[test]
 fn sqlite_sink_rejects_malformed_log_id_blobs() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("query.sqlite");

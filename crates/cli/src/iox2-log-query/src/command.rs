@@ -455,7 +455,7 @@ fn index_catch_up(
 }
 
 fn status(options: StatusOptions, format: Format) -> Result<(), LogQueryCommandError> {
-    ensure_schema_compatibility(&options.db_path, false)?;
+    ensure_existing_schema_compatibility(&options.db_path)?;
     let mut states =
         SqliteMetadataSink::list_indexer_states(&options.db_path).map_err(map_sink_error)?;
     if let Some(stream_id) = options.stream_id.as_ref() {
@@ -500,7 +500,7 @@ fn status(options: StatusOptions, format: Format) -> Result<(), LogQueryCommandE
 
 fn locate_sequence(options: LocateSequenceOptions) -> Result<(), LogQueryCommandError> {
     validate_stream_id(&options.stream_id)?;
-    ensure_schema_compatibility(&options.db_path, false)?;
+    ensure_existing_schema_compatibility(&options.db_path)?;
     let sink = SqliteMetadataSink::open_for_stream(&options.db_path, &options.stream_id)
         .map_err(map_sink_error)?;
     let state = load_state_or_default(&sink, &options.stream_id)?;
@@ -528,7 +528,7 @@ fn locate_sequence(options: LocateSequenceOptions) -> Result<(), LogQueryCommand
 
 fn locate_range(options: LocateRangeOptions, format: Format) -> Result<(), LogQueryCommandError> {
     validate_stream_id(&options.stream_id)?;
-    ensure_schema_compatibility(&options.db_path, false)?;
+    ensure_existing_schema_compatibility(&options.db_path)?;
     if options.count == 0 {
         return Err(LogQueryCommandError::InvalidInput(
             "--count must be > 0".to_string(),
@@ -608,7 +608,7 @@ fn locate_range(options: LocateRangeOptions, format: Format) -> Result<(), LogQu
 
 fn locate_locator(options: LocateLocatorOptions) -> Result<(), LogQueryCommandError> {
     validate_stream_id(&options.stream_id)?;
-    ensure_schema_compatibility(&options.db_path, false)?;
+    ensure_existing_schema_compatibility(&options.db_path)?;
     let locator = parse_locator(&options.at)?;
     let sink = SqliteMetadataSink::open_for_stream(&options.db_path, &options.stream_id)
         .map_err(map_sink_error)?;
@@ -639,7 +639,7 @@ fn locate_locator(options: LocateLocatorOptions) -> Result<(), LogQueryCommandEr
 
 fn locate_window(options: LocateWindowOptions, format: Format) -> Result<(), LogQueryCommandError> {
     validate_stream_id(&options.stream_id)?;
-    ensure_schema_compatibility(&options.db_path, false)?;
+    ensure_existing_schema_compatibility(&options.db_path)?;
     if options.emit == QueryEmitMode::Aligned {
         return Err(LogQueryCommandError::InvalidInput(
             "--emit aligned is not supported by locate-window".to_string(),
@@ -693,7 +693,7 @@ fn locate_window(options: LocateWindowOptions, format: Format) -> Result<(), Log
 }
 
 fn align_window(options: AlignWindowOptions, format: Format) -> Result<(), LogQueryCommandError> {
-    ensure_schema_compatibility(&options.db_path, false)?;
+    ensure_existing_schema_compatibility(&options.db_path)?;
     let stream_ids = normalize_streams(&options.streams)?;
     let (start_ns, end_ns) = resolve_time_window(
         options.start_ns,
@@ -1725,6 +1725,17 @@ fn ensure_schema_compatibility(
     }
 
     Ok(())
+}
+
+fn ensure_existing_schema_compatibility(db_path: &Path) -> Result<(), LogQueryCommandError> {
+    if !db_path.exists() {
+        return Err(LogQueryCommandError::NotAvailable(format!(
+            "query database not found at {}",
+            db_path.display()
+        )));
+    }
+
+    ensure_schema_compatibility(db_path, false)
 }
 
 fn reset_index_db(db_path: &Path) -> Result<(), LogQueryCommandError> {

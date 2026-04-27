@@ -11,11 +11,71 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
 
 use iox2_log_archive_core::log_archive::{
     ArchiveRecorderBuilder, ChecksumMode, PersistenceMode, PublishSubscribeRecordInput,
 };
+
+fn assert_success(output: &Output, context: &str) {
+    assert!(
+        output.status.success(),
+        "{context} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_failure_contains(output: &Output, expected: &str, context: &str) {
+    assert!(
+        !output.status.success(),
+        "{context} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains(expected),
+        "{context} did not contain {expected:?}\ncombined output:\n{combined}"
+    );
+}
+
+fn archive_args(service: &str, storage_path: &Path, metadata_path: &Path) -> Vec<String> {
+    vec![
+        "--service".to_string(),
+        service.to_string(),
+        "--storage-path".to_string(),
+        storage_path
+            .to_str()
+            .expect("utf-8 storage path")
+            .to_string(),
+        "--metadata-log-path".to_string(),
+        metadata_path
+            .to_str()
+            .expect("utf-8 metadata path")
+            .to_string(),
+    ]
+}
+
+fn replay_archive_args(storage_path: &Path, metadata_path: &Path) -> Vec<String> {
+    vec![
+        "--storage-path".to_string(),
+        storage_path
+            .to_str()
+            .expect("utf-8 storage path")
+            .to_string(),
+        "--metadata-log-path".to_string(),
+        metadata_path
+            .to_str()
+            .expect("utf-8 metadata path")
+            .to_string(),
+    ]
+}
 
 fn create_archive(
     storage_path: &std::path::Path,
@@ -45,6 +105,56 @@ fn create_archive(
     Ok(())
 }
 
+fn index_archive(
+    metadata_path: &Path,
+    db_path: &Path,
+    stream_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_iox2-log-query"))
+        .args([
+            "--format",
+            "JSON",
+            "index",
+            "catch-up",
+            "--stream-id",
+            stream_id,
+            "--metadata-log-path",
+            metadata_path.to_str().expect("utf-8 metadata path"),
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+        ])
+        .output()?;
+    assert_success(&output, "index catch-up");
+    Ok(())
+}
+
+fn first_locator_from_range(
+    db_path: &Path,
+    stream_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_iox2-log-query"))
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-range",
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+            "--stream-id",
+            stream_id,
+            "--from",
+            "1",
+            "--count",
+            "1",
+            "--emit",
+            "selectors",
+            "--expand-selectors",
+        ])
+        .output()?;
+    assert_success(&output, "locate-range for locator");
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 #[test]
 fn query_expanded_selectors_pipe_to_replay_stdout() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
@@ -53,30 +163,10 @@ fn query_expanded_selectors_pipe_to_replay_stdout() -> Result<(), Box<dyn std::e
     let db_path = temp.path().join("query.sqlite");
     create_archive(&storage_path, &metadata_path)?;
 
-    let query_bin = env!("CARGO_BIN_EXE_iox2-log-query");
     let replay_bin = env!("CARGO_BIN_EXE_iox2-log-replay");
+    index_archive(&metadata_path, &db_path, "smoke")?;
 
-    let index = Command::new(query_bin)
-        .args([
-            "--format",
-            "JSON",
-            "index",
-            "catch-up",
-            "--stream-id",
-            "smoke",
-            "--metadata-log-path",
-            metadata_path.to_str().expect("utf-8 metadata path"),
-            "--db-path",
-            db_path.to_str().expect("utf-8 db path"),
-        ])
-        .output()?;
-    assert!(
-        index.status.success(),
-        "index failed: {}",
-        String::from_utf8_lossy(&index.stderr)
-    );
-
-    let selectors = Command::new(query_bin)
+    let selectors = Command::new(env!("CARGO_BIN_EXE_iox2-log-query"))
         .args([
             "--format",
             "JSON",
@@ -95,11 +185,7 @@ fn query_expanded_selectors_pipe_to_replay_stdout() -> Result<(), Box<dyn std::e
             "--expand-selectors",
         ])
         .output()?;
-    assert!(
-        selectors.status.success(),
-        "query failed: {}",
-        String::from_utf8_lossy(&selectors.stderr)
-    );
+    assert_success(&selectors, "query locate-range");
     assert_eq!(
         String::from_utf8_lossy(&selectors.stdout).lines().count(),
         4
@@ -131,11 +217,7 @@ fn query_expanded_selectors_pipe_to_replay_stdout() -> Result<(), Box<dyn std::e
         .expect("piped stdin")
         .write_all(&selectors.stdout)?;
     let replay = replay.wait_with_output()?;
-    assert!(
-        replay.status.success(),
-        "replay failed: {}",
-        String::from_utf8_lossy(&replay.stderr)
-    );
+    assert_success(&replay, "replay from piped selectors");
     assert_eq!(String::from_utf8_lossy(&replay.stdout).lines().count(), 4);
     assert!(String::from_utf8_lossy(&replay.stderr).contains("\"emitted\": 4"));
 
@@ -163,11 +245,7 @@ fn replay_all_replays_every_record() -> Result<(), Box<dyn std::error::Error>> {
             "all",
         ])
         .output()?;
-    assert!(
-        replay.status.success(),
-        "replay all failed: {}",
-        String::from_utf8_lossy(&replay.stderr)
-    );
+    assert_success(&replay, "replay all");
     assert_eq!(String::from_utf8_lossy(&replay.stdout).lines().count(), 4);
     assert!(String::from_utf8_lossy(&replay.stderr).contains("\"selector_source\": \"all\""));
     assert!(String::from_utf8_lossy(&replay.stderr).contains("\"emitted\": 4"));
@@ -181,11 +259,7 @@ fn recorder_help_exposes_general_throughput_profile_only() -> Result<(), Box<dyn
     let help = Command::new(env!("CARGO_BIN_EXE_iox2-log-recorder"))
         .args(["publish-subscribe", "--help"])
         .output()?;
-    assert!(
-        help.status.success(),
-        "help failed: {}",
-        String::from_utf8_lossy(&help.stderr)
-    );
+    assert_success(&help, "recorder help");
 
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(stdout.contains("durable, balanced, throughput, replay"));
@@ -219,16 +293,590 @@ fn recorder_rejects_zero_borrowed_sample_capacity() -> Result<(), Box<dyn std::e
         ])
         .output()?;
 
-    assert!(
-        !output.status.success(),
-        "recorder unexpectedly accepted zero borrowed-sample capacity"
+    assert_failure_contains(
+        &output,
+        "--subscriber-max-borrowed-samples must be greater than 0",
+        "recorder zero borrowed-sample capacity",
     );
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("--subscriber-max-borrowed-samples must be greater than 0"),
-        "stderr did not contain validation error: {}",
-        String::from_utf8_lossy(&output.stderr)
+
+    Ok(())
+}
+
+#[test]
+fn admin_commands_cover_archive_lifecycle_and_inspection() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    create_archive(&storage_path, &metadata_path)?;
+
+    let admin_bin = env!("CARGO_BIN_EXE_iox2-log-admin");
+    let service = "Test/Admin/Coverage";
+    let archive = archive_args(service, &storage_path, &metadata_path);
+
+    for (command, expected) in [
+        ("status", "\"operation\": \"status\""),
+        ("flush", "\"operation\": \"flush\""),
+        ("list-segments", "\"segments\""),
+    ] {
+        let mut args = vec![
+            "--format".to_string(),
+            "JSON".to_string(),
+            command.to_string(),
+        ];
+        args.extend(archive.clone());
+        let output = Command::new(admin_bin).args(args).output()?;
+        assert_success(&output, command);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected),
+            "{command} stdout missing {expected}"
+        );
+    }
+
+    let mut inspect_log_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "inspect-commit-log".to_string(),
+    ];
+    inspect_log_args.extend(archive.clone());
+    inspect_log_args.extend(["--from-ordinal".to_string(), "2".to_string()]);
+    inspect_log_args.extend(["--limit".to_string(), "2".to_string()]);
+    let output = Command::new(admin_bin).args(inspect_log_args).output()?;
+    assert_success(&output, "inspect-commit-log");
+    let inspect_log: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(inspect_log["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(inspect_log["entries"][0]["sequence"], 2);
+
+    let mut inspect_record_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "inspect-record".to_string(),
+    ];
+    inspect_record_args.extend(archive.clone());
+    inspect_record_args.extend(["--at-sequence".to_string(), "3".to_string()]);
+    inspect_record_args.extend(["--preview-bytes".to_string(), "2".to_string()]);
+    let output = Command::new(admin_bin).args(inspect_record_args).output()?;
+    assert_success(&output, "inspect-record");
+    let record: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["record"]["sequence"], 3);
+    assert_eq!(record["record"]["payload"]["preview_len"], 2);
+    assert_eq!(record["record"]["payload"]["truncated"], true);
+
+    let mut detach_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "detach".to_string(),
+    ];
+    detach_args.extend(archive.clone());
+    detach_args.extend(["--before-sequence".to_string(), "5".to_string()]);
+    let output = Command::new(admin_bin).args(detach_args).output()?;
+    assert_success(&output, "detach");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"affected_segments\": 1"));
+
+    let mut list_detached_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "list-segments".to_string(),
+    ];
+    list_detached_args.extend(archive.clone());
+    list_detached_args.push("--detached-only".to_string());
+    let output = Command::new(admin_bin).args(list_detached_args).output()?;
+    assert_success(&output, "list detached segments");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"tier\": \"ColdDetached\""));
+
+    let mut attach_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "attach".to_string(),
+    ];
+    attach_args.extend(archive.clone());
+    let output = Command::new(admin_bin).args(attach_args).output()?;
+    assert_success(&output, "attach");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"affected_segments\": 1"));
+
+    let mut trim_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "trim".to_string(),
+    ];
+    trim_args.extend(archive);
+    trim_args.extend(["--before-sequence".to_string(), "0".to_string()]);
+    let output = Command::new(admin_bin).args(trim_args).output()?;
+    assert_success(&output, "trim no-op");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"operation\": \"trim\""));
+
+    Ok(())
+}
+
+#[test]
+fn admin_and_control_report_validation_errors() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let missing_storage = temp.path().join("missing-archive");
+    let missing_metadata = temp.path().join("missing-metadata");
+
+    let mut missing_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "status".to_string(),
+    ];
+    missing_args.extend(archive_args(
+        "Test/Admin/Missing",
+        &missing_storage,
+        &missing_metadata,
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_iox2-log-admin"))
+        .args(missing_args)
+        .output()?;
+    assert_failure_contains(&output, "archive not found", "admin missing archive");
+
+    let limit_output = Command::new(env!("CARGO_BIN_EXE_iox2-log-admin"))
+        .args([
+            "--format",
+            "JSON",
+            "inspect-commit-log",
+            "--service",
+            "",
+            "--storage-path",
+            missing_storage.to_str().expect("utf-8 storage path"),
+            "--metadata-log-path",
+            missing_metadata.to_str().expect("utf-8 metadata path"),
+            "--limit",
+            "0",
+        ])
+        .output()?;
+    assert_failure_contains(&limit_output, "--limit must be > 0", "admin zero limit");
+
+    let empty_service = Command::new(env!("CARGO_BIN_EXE_iox2-log-control"))
+        .args([
+            "--format",
+            "JSON",
+            "status",
+            "--service",
+            "",
+            "--timeout-ms",
+            "1",
+        ])
+        .output()?;
+    assert_failure_contains(
+        &empty_service,
+        "--service must not be empty",
+        "control empty service",
     );
+
+    let zero_timeout = Command::new(env!("CARGO_BIN_EXE_iox2-log-control"))
+        .args([
+            "--format",
+            "JSON",
+            "flush",
+            "--service",
+            "Test/Control/ZeroTimeout",
+            "--timeout-ms",
+            "0",
+        ])
+        .output()?;
+    assert_failure_contains(
+        &zero_timeout,
+        "--timeout-ms must be greater than 0",
+        "control zero timeout",
+    );
+
+    let unavailable = Command::new(env!("CARGO_BIN_EXE_iox2-log-control"))
+        .args([
+            "--format",
+            "JSON",
+            "status",
+            "--service",
+            "Test/Control/Unavailable",
+            "--timeout-ms",
+            "1",
+        ])
+        .output()?;
+    assert_failure_contains(
+        &unavailable,
+        "recorder daemon control service",
+        "control unavailable daemon",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn query_commands_cover_status_locators_windows_and_alignment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    let db_path = temp.path().join("query.sqlite");
+    create_archive(&storage_path, &metadata_path)?;
+    index_archive(&metadata_path, &db_path, "cam-a")?;
+
+    let query_bin = env!("CARGO_BIN_EXE_iox2-log-query");
+
+    let status = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "status",
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+        ])
+        .output()?;
+    assert_success(&status, "query status");
+    assert!(String::from_utf8_lossy(&status.stdout).contains("\"stream_count\": 1"));
+
+    let sequence = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-sequence",
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+            "--stream-id",
+            "cam-a",
+            "--at",
+            "2",
+        ])
+        .output()?;
+    assert_success(&sequence, "locate-sequence");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&sequence.stdout)?["sequence"],
+        2
+    );
+
+    let locator = first_locator_from_range(&db_path, "cam-a")?;
+    let locator_text = format!(
+        "{}:{}:{}:{}",
+        locator["segment_id"].as_u64().unwrap(),
+        locator["segment_generation"].as_u64().unwrap(),
+        locator["file_offset"].as_u64().unwrap(),
+        locator["frame_len"].as_u64().unwrap()
+    );
+    let locator_output = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-locator",
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+            "--stream-id",
+            "cam-a",
+            "--at",
+            &locator_text,
+        ])
+        .output()?;
+    assert_success(&locator_output, "locate-locator");
+    assert!(String::from_utf8_lossy(&locator_output.stdout).contains("\"kind\":\"locator\""));
+
+    let window = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-window",
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+            "--stream-id",
+            "cam-a",
+            "--start-ns",
+            "1000",
+            "--end-ns",
+            "4000",
+            "--emit",
+            "summary",
+        ])
+        .output()?;
+    assert_success(&window, "locate-window summary");
+    assert!(String::from_utf8_lossy(&window.stdout).contains("\"rows\": 4"));
+
+    let align = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "align-window",
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+            "--streams",
+            "cam-a",
+            "--start-ns",
+            "1000",
+            "--end-ns",
+            "4000",
+            "--mode",
+            "anchor",
+            "--anchor-stream",
+            "cam-a",
+            "--emit",
+            "summary",
+        ])
+        .output()?;
+    assert_success(&align, "align-window summary");
+    assert!(String::from_utf8_lossy(&align.stdout).contains("\"rows\": 4"));
+
+    let empty_window = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-window",
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+            "--stream-id",
+            "cam-a",
+            "--start-ns",
+            "9000",
+            "--end-ns",
+            "10000",
+            "--emit",
+            "summary",
+        ])
+        .output()?;
+    assert_success(&empty_window, "empty locate-window summary");
+    assert!(String::from_utf8_lossy(&empty_window.stdout).contains("\"rows\": 0"));
+
+    Ok(())
+}
+
+#[test]
+fn query_commands_report_invalid_inputs() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    let db_path = temp.path().join("query.sqlite");
+    create_archive(&storage_path, &metadata_path)?;
+    index_archive(&metadata_path, &db_path, "cam-a")?;
+
+    let query_bin = env!("CARGO_BIN_EXE_iox2-log-query");
+    let db = db_path.to_str().expect("utf-8 db path");
+
+    for (args, expected, context) in [
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-range",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-a",
+                "--from",
+                "1",
+                "--count",
+                "0",
+            ],
+            "--count must be > 0",
+            "locate-range zero count",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-range",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-a",
+                "--from",
+                "1",
+                "--count",
+                "1",
+                "--emit",
+                "aligned",
+            ],
+            "--emit aligned is not supported by locate-range",
+            "locate-range aligned",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-locator",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-a",
+                "--at",
+                "bad",
+            ],
+            "invalid locator 'bad'",
+            "locate-locator invalid locator",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "locate-window",
+                "--db-path",
+                db,
+                "--stream-id",
+                "cam-a",
+                "--start-ns",
+                "2",
+                "--end-ns",
+                "1",
+            ],
+            "time window start must be <= end",
+            "locate-window invalid range",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "align-window",
+                "--db-path",
+                db,
+                "--streams",
+                "cam-a",
+                "--start-ns",
+                "1",
+                "--end-ns",
+                "2",
+                "--mode",
+                "grid",
+            ],
+            "--step-ns is required with --mode grid",
+            "align-window missing step",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "query",
+                "align-window",
+                "--db-path",
+                db,
+                "--streams",
+                "cam-a",
+                "--start-ns",
+                "1",
+                "--end-ns",
+                "2",
+                "--mode",
+                "anchor",
+                "--anchor-stream",
+                "cam-b",
+            ],
+            "--anchor-stream must be part of --streams",
+            "align-window invalid anchor",
+        ),
+    ] {
+        let output = Command::new(query_bin).args(args).output()?;
+        assert_failure_contains(&output, expected, context);
+    }
+
+    let missing_db = temp.path().join("missing.sqlite");
+    let missing = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "status",
+            "--db-path",
+            missing_db.to_str().expect("utf-8 db path"),
+        ])
+        .output()?;
+    assert_failure_contains(&missing, "query database not found", "query missing db");
+
+    Ok(())
+}
+
+#[test]
+fn replay_commands_cover_error_modes_and_rate_validation() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    create_archive(&storage_path, &metadata_path)?;
+
+    let replay_bin = env!("CARGO_BIN_EXE_iox2-log-replay");
+    let mut base = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "replay".to_string(),
+    ];
+    base.extend(replay_archive_args(&storage_path, &metadata_path));
+    base.extend(["--to".to_string(), "stdout".to_string()]);
+
+    let mut recorded_args = base.clone();
+    recorded_args.extend(["--rate".to_string(), "recorded".to_string()]);
+    recorded_args.push("all".to_string());
+    let output = Command::new(replay_bin).args(recorded_args).output()?;
+    assert_success(&output, "replay recorded-rate all");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 4);
+
+    let mut fixed_args = base.clone();
+    fixed_args.extend(["--rate".to_string(), "fixed".to_string()]);
+    fixed_args.extend(["--messages-per-sec".to_string(), "1000000".to_string()]);
+    fixed_args.extend(["sequence".to_string(), "--at".to_string(), "1".to_string()]);
+    let output = Command::new(replay_bin).args(fixed_args).output()?;
+    assert_success(&output, "replay fixed-rate sequence");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
+
+    let mut missing_skip_args = base.clone();
+    missing_skip_args.push("--skip-missing".to_string());
+    missing_skip_args.extend(["--max-errors".to_string(), "1".to_string()]);
+    missing_skip_args.extend(["sequence".to_string(), "--at".to_string(), "99".to_string()]);
+    let output = Command::new(replay_bin).args(missing_skip_args).output()?;
+    assert_success(&output, "replay skip missing sequence");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"skipped_missing\": 1"));
+
+    for (args, expected, context) in [
+        {
+            let mut args = base.clone();
+            args.extend(["locator".to_string(), "--at".to_string(), "bad".to_string()]);
+            (args, "invalid locator 'bad'", "replay invalid locator")
+        },
+        {
+            let mut args = base.clone();
+            args.extend(["range".to_string(), "--from".to_string(), "1".to_string()]);
+            args.extend(["--count".to_string(), "0".to_string()]);
+            (args, "--count must be > 0", "replay zero range count")
+        },
+        {
+            let mut args = base.clone();
+            args.extend(["--rate".to_string(), "fixed".to_string()]);
+            args.extend(["sequence".to_string(), "--at".to_string(), "1".to_string()]);
+            (
+                args,
+                "--messages-per-sec is required when --rate=fixed",
+                "replay fixed rate missing messages_per_sec",
+            )
+        },
+        {
+            let mut args = base.clone();
+            args.extend(["--max-errors".to_string(), "0".to_string()]);
+            args.extend(["sequence".to_string(), "--at".to_string(), "99".to_string()]);
+            (args, "--max-errors must be > 0", "replay zero max errors")
+        },
+        {
+            let mut args = base.clone();
+            args.extend(["--service".to_string(), "not-valid-for-stdout".to_string()]);
+            args.extend(["sequence".to_string(), "--at".to_string(), "1".to_string()]);
+            (
+                args,
+                "--service is only valid with --to=publish-subscribe",
+                "replay stdout service",
+            )
+        },
+        {
+            let mut args = base.clone();
+            args.extend(["sequence".to_string(), "--at".to_string(), "99".to_string()]);
+            (
+                args,
+                "sequence 99 is not available",
+                "replay missing sequence",
+            )
+        },
+    ] {
+        let output = Command::new(replay_bin).args(&args).output()?;
+        assert_failure_contains(&output, expected, context);
+    }
 
     Ok(())
 }
