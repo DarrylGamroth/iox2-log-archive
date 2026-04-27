@@ -1,5 +1,7 @@
 # iox2-log-archive
 
+[![CI](https://github.com/DarrylGamroth/iox2-log-archive/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DarrylGamroth/iox2-log-archive/actions/workflows/ci.yml)
+
 Standalone high-rate recorder/replay tooling for iceoryx2 data.
 
 This repository is intentionally outside the upstream `iceoryx2` workspace. The

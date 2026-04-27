@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::log_archive::{ARCHIVE_FILE_HEADER_V1_LEN, ArchiveFileHeaderV1, ArchiveFileKind};
 
-use super::backend::RecorderIoBackend;
+use super::backend::{ExternalPayloadWrite, RecorderIoBackend};
 use super::common::*;
 use super::storage::*;
 
@@ -1529,17 +1529,17 @@ impl ArchiveRecorder {
 
         let (write_result, frame_checksum) = match input.payload {
             RecordPayload::External { ptr, len, owner } => {
-                let mut header = encode_frame_header(
+                let mut header = encode_frame_header(FrameHeaderInput {
                     commit_ordinal,
-                    input.sequence,
-                    input.event_time_ns,
+                    sequence: input.sequence,
+                    event_time_ns: input.event_time_ns,
                     commit_time_ns,
                     user_header_len,
-                    len,
+                    payload_len: len,
                     frame_len,
-                    self.config.checksum_mode,
-                    0,
-                );
+                    checksum_mode: self.config.checksum_mode,
+                    checksum: 0,
+                });
                 let user_header = input.user_header.to_vec();
                 let padding_len = frame_len - FRAME_HEADER_LEN - user_header_len - len;
                 let owned_suffix =
@@ -1578,14 +1578,16 @@ impl ArchiveRecorder {
                     unsafe {
                         io_backend.write_vectored_external_at(
                             &mut active.file,
-                            &segment_path,
-                            locator.file_offset,
-                            owned_prefixes,
-                            ptr,
-                            len,
-                            owned_suffix,
-                            owner,
-                            "write active segment",
+                            ExternalPayloadWrite {
+                                path: &segment_path,
+                                offset: locator.file_offset,
+                                owned_prefixes,
+                                external_ptr: ptr,
+                                external_len: len,
+                                owned_suffix,
+                                owner,
+                                operation: "write active segment",
+                            },
                         )
                     }
                 };

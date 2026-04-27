@@ -992,42 +992,44 @@ impl EncodedFrame {
     }
 }
 
-pub(super) fn encode_frame_header(
-    commit_ordinal: u64,
-    sequence: u64,
-    event_time_ns: u64,
-    commit_time_ns: u64,
-    user_header_len: usize,
-    payload_len: usize,
-    frame_len: usize,
-    checksum_mode: ChecksumMode,
-    checksum: u32,
-) -> [u8; FRAME_HEADER_LEN] {
+pub(super) struct FrameHeaderInput {
+    pub commit_ordinal: u64,
+    pub sequence: u64,
+    pub event_time_ns: u64,
+    pub commit_time_ns: u64,
+    pub user_header_len: usize,
+    pub payload_len: usize,
+    pub frame_len: usize,
+    pub checksum_mode: ChecksumMode,
+    pub checksum: u32,
+}
+
+pub(super) fn encode_frame_header(input: FrameHeaderInput) -> [u8; FRAME_HEADER_LEN] {
     let mut bytes = [0u8; FRAME_HEADER_LEN];
     bytes[FRAME_OFFSET_MAGIC..FRAME_OFFSET_MAGIC + 4].copy_from_slice(&FRAME_MAGIC);
     bytes[FRAME_OFFSET_HEADER_LEN..FRAME_OFFSET_HEADER_LEN + 2]
         .copy_from_slice(&(FRAME_HEADER_LEN as u16).to_le_bytes());
     let mut flags = 0u16;
-    if checksum_mode == ChecksumMode::Crc32c {
+    if input.checksum_mode == ChecksumMode::Crc32c {
         flags |= FRAME_FLAG_CHECKSUM_CRC32C;
     }
     bytes[FRAME_OFFSET_FLAGS..FRAME_OFFSET_FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
     bytes[FRAME_OFFSET_FRAME_LEN..FRAME_OFFSET_FRAME_LEN + 4]
-        .copy_from_slice(&(frame_len as u32).to_le_bytes());
+        .copy_from_slice(&(input.frame_len as u32).to_le_bytes());
     bytes[FRAME_OFFSET_COMMIT_ORDINAL..FRAME_OFFSET_COMMIT_ORDINAL + 8]
-        .copy_from_slice(&commit_ordinal.to_le_bytes());
+        .copy_from_slice(&input.commit_ordinal.to_le_bytes());
     bytes[FRAME_OFFSET_SEQUENCE..FRAME_OFFSET_SEQUENCE + 8]
-        .copy_from_slice(&sequence.to_le_bytes());
+        .copy_from_slice(&input.sequence.to_le_bytes());
     bytes[FRAME_OFFSET_EVENT_TIME_NS..FRAME_OFFSET_EVENT_TIME_NS + 8]
-        .copy_from_slice(&event_time_ns.to_le_bytes());
+        .copy_from_slice(&input.event_time_ns.to_le_bytes());
     bytes[FRAME_OFFSET_COMMIT_TIME_NS..FRAME_OFFSET_COMMIT_TIME_NS + 8]
-        .copy_from_slice(&commit_time_ns.to_le_bytes());
+        .copy_from_slice(&input.commit_time_ns.to_le_bytes());
     bytes[FRAME_OFFSET_USER_HEADER_LEN..FRAME_OFFSET_USER_HEADER_LEN + 4]
-        .copy_from_slice(&(user_header_len as u32).to_le_bytes());
+        .copy_from_slice(&(input.user_header_len as u32).to_le_bytes());
     bytes[FRAME_OFFSET_PAYLOAD_LEN..FRAME_OFFSET_PAYLOAD_LEN + 4]
-        .copy_from_slice(&(payload_len as u32).to_le_bytes());
+        .copy_from_slice(&(input.payload_len as u32).to_le_bytes());
     bytes[FRAME_OFFSET_CHECKSUM..FRAME_OFFSET_CHECKSUM + 4]
-        .copy_from_slice(&checksum.to_le_bytes());
+        .copy_from_slice(&input.checksum.to_le_bytes());
     bytes
 }
 

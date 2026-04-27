@@ -174,3 +174,61 @@ fn replay_all_replays_every_record() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn recorder_help_exposes_general_throughput_profile_only() -> Result<(), Box<dyn std::error::Error>>
+{
+    let help = Command::new(env!("CARGO_BIN_EXE_iox2-log-recorder"))
+        .args(["publish-subscribe", "--help"])
+        .output()?;
+    assert!(
+        help.status.success(),
+        "help failed: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(stdout.contains("durable, balanced, throughput, replay"));
+    assert!(stdout.contains("--subscriber-max-borrowed-samples"));
+    assert!(!stdout.contains("camera-throughput"));
+
+    Ok(())
+}
+
+#[test]
+fn recorder_rejects_zero_borrowed_sample_capacity() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_iox2-log-recorder"))
+        .args([
+            "--format",
+            "JSON",
+            "publish-subscribe",
+            "--service",
+            "Test/Recorder/InvalidBorrowCapacity",
+            "--storage-path",
+            storage_path.to_str().expect("utf-8 storage path"),
+            "--metadata-log-path",
+            metadata_path.to_str().expect("utf-8 metadata path"),
+            "--subscriber-max-borrowed-samples",
+            "0",
+            "--timeout-ms",
+            "1",
+        ])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "recorder unexpectedly accepted zero borrowed-sample capacity"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--subscriber-max-borrowed-samples must be greater than 0"),
+        "stderr did not contain validation error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(())
+}

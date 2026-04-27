@@ -87,6 +87,17 @@ pub(super) enum RecorderIoBackend {
     IoUring(Box<IoUringBackend>),
 }
 
+pub(super) struct ExternalPayloadWrite<'a> {
+    pub path: &'a Path,
+    pub offset: u64,
+    pub owned_prefixes: Vec<Box<[u8]>>,
+    pub external_ptr: *const u8,
+    pub external_len: usize,
+    pub owned_suffix: Option<Box<[u8]>>,
+    pub owner: Box<dyn Any>,
+    pub operation: &'static str,
+}
+
 impl RecorderIoBackend {
     pub(super) fn create(
         requested: AsyncIoBackend,
@@ -222,62 +233,47 @@ impl RecorderIoBackend {
     pub(super) unsafe fn write_vectored_external_at(
         &mut self,
         file: &mut File,
-        path: &Path,
-        offset: u64,
-        owned_prefixes: Vec<Box<[u8]>>,
-        external_ptr: *const u8,
-        external_len: usize,
-        owned_suffix: Option<Box<[u8]>>,
-        owner: Box<dyn Any>,
-        operation: &'static str,
+        write: ExternalPayloadWrite<'_>,
     ) -> Result<(), ArchiveRecorderError> {
         match self {
             Self::Blocking(_) => {
-                file.seek(SeekFrom::Start(offset))
-                    .map_err(|source| ArchiveRecorderError::Io {
-                        operation,
-                        path: path.to_path_buf(),
+                file.seek(SeekFrom::Start(write.offset)).map_err(|source| {
+                    ArchiveRecorderError::Io {
+                        operation: write.operation,
+                        path: write.path.to_path_buf(),
                         source,
-                    })?;
-                for prefix in &owned_prefixes {
+                    }
+                })?;
+                for prefix in &write.owned_prefixes {
                     file.write_all(prefix)
                         .map_err(|source| ArchiveRecorderError::Io {
-                            operation,
-                            path: path.to_path_buf(),
+                            operation: write.operation,
+                            path: write.path.to_path_buf(),
                             source,
                         })?;
                 }
-                let payload = unsafe { core::slice::from_raw_parts(external_ptr, external_len) };
+                let payload =
+                    unsafe { core::slice::from_raw_parts(write.external_ptr, write.external_len) };
                 file.write_all(payload)
                     .map_err(|source| ArchiveRecorderError::Io {
-                        operation,
-                        path: path.to_path_buf(),
+                        operation: write.operation,
+                        path: write.path.to_path_buf(),
                         source,
                     })?;
-                if let Some(suffix) = &owned_suffix {
+                if let Some(suffix) = &write.owned_suffix {
                     file.write_all(suffix)
                         .map_err(|source| ArchiveRecorderError::Io {
-                            operation,
-                            path: path.to_path_buf(),
+                            operation: write.operation,
+                            path: write.path.to_path_buf(),
                             source,
                         })?;
                 }
-                drop(owner);
+                drop(write.owner);
                 Ok(())
             }
             #[cfg(target_os = "linux")]
             Self::IoUring(backend) => unsafe {
-                backend.enqueue_vectored_external_write(
-                    file,
-                    path,
-                    offset,
-                    owned_prefixes,
-                    external_ptr,
-                    external_len,
-                    owned_suffix,
-                    owner,
-                    operation,
-                )
+                backend.enqueue_vectored_external_write(file, write)
             },
         }
     }
@@ -415,21 +411,15 @@ impl IoUringBackend {
     unsafe fn enqueue_vectored_external_write(
         &mut self,
         file: &File,
-        path: &Path,
-        offset: u64,
-        owned_prefixes: Vec<Box<[u8]>>,
-        external_ptr: *const u8,
-        external_len: usize,
-        owned_suffix: Option<Box<[u8]>>,
-        owner: Box<dyn Any>,
-        operation: &'static str,
+        write: ExternalPayloadWrite<'_>,
     ) -> Result<(), ArchiveRecorderError> {
-        let total_len = owned_prefixes
+        let total_len = write
+            .owned_prefixes
             .iter()
             .map(|buffer| buffer.len())
             .sum::<usize>()
-            + external_len
-            + owned_suffix.as_ref().map_or(0, |buffer| buffer.len());
+            + write.external_len
+            + write.owned_suffix.as_ref().map_or(0, |buffer| buffer.len());
         if total_len == 0 {
             return Ok(());
         }
@@ -437,27 +427,27 @@ impl IoUringBackend {
         let user_data = self.next_user_data;
         self.next_user_data = self.next_user_data.wrapping_add(1);
         let iovecs = build_iovecs(
-            &owned_prefixes,
-            external_ptr,
-            external_len,
-            owned_suffix.as_deref(),
+            &write.owned_prefixes,
+            write.external_ptr,
+            write.external_len,
+            write.owned_suffix.as_deref(),
             0,
         );
         let pending = PendingWrite {
             fd: file.as_raw_fd(),
-            offset,
+            offset: write.offset,
             written: 0,
             kind: PendingWriteKind::Vectored {
-                owned_prefixes,
-                external_ptr,
-                external_len,
-                owned_suffix,
+                owned_prefixes: write.owned_prefixes,
+                external_ptr: write.external_ptr,
+                external_len: write.external_len,
+                owned_suffix: write.owned_suffix,
                 iovecs,
                 total_len,
-                _owner: owner,
+                _owner: write.owner,
             },
-            operation,
-            path: path.to_path_buf(),
+            operation: write.operation,
+            path: write.path.to_path_buf(),
         };
         self.pending_writes.insert(user_data, pending);
         self.push_write_entry(user_data)?;
