@@ -28,14 +28,52 @@ use super::storage::*;
 
 const DEFAULT_METADATA_LOG_ROLL_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_METADATA_LOG_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const COMMIT_LOG_BATCH_ENTRIES: usize = 256;
 const ZERO_LOG_ID: [u8; 16] = [0u8; 16];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct RecordInput<'a> {
     sequence: u64,
     event_time_ns: u64,
-    user_header: &'a [u8],
-    payload: &'a [u8],
+    user_header: EncodedUserHeader<'a>,
+    payload: RecordPayload<'a>,
+}
+
+enum RecordPayload<'a> {
+    Borrowed(&'a [u8]),
+    External {
+        ptr: *const u8,
+        len: usize,
+        owner: Box<dyn core::any::Any>,
+    },
+}
+
+impl core::fmt::Debug for RecordPayload<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Borrowed(payload) => f
+                .debug_struct("Borrowed")
+                .field("len", &payload.len())
+                .finish(),
+            Self::External { len, .. } => f.debug_struct("External").field("len", len).finish(),
+        }
+    }
+}
+
+impl RecordPayload<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(payload) => payload.len(),
+            Self::External { len, .. } => *len,
+        }
+    }
+
+    unsafe fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(payload) => payload,
+            Self::External { ptr, len, .. } => unsafe { core::slice::from_raw_parts(*ptr, *len) },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,7 +121,7 @@ fn profile_defaults(profile: RecorderProfile) -> ProfileDefaults {
             spare_preallocated_segments: 2,
             persistence_mode: PersistenceMode::Async,
             async_io_backend: AsyncIoBackend::IoUringRequired,
-            io_uring_queue_depth: 1024,
+            io_uring_queue_depth: 256,
             io_submit_batch_max: 256,
             io_cqe_batch_max: 512,
             io_uring_register_files: true,
@@ -429,12 +467,6 @@ impl ArchiveRecorderBuilder {
                 "segment_generation must be > 0",
             ));
         }
-        if self.checksum_mode == ChecksumMode::None {
-            return Err(ArchiveRecorderError::InvalidConfiguration(
-                "checksum_mode None is not allowed; framing checksum is mandatory",
-            ));
-        }
-
         Ok(RecorderConfig {
             profile: self.profile,
             storage_path: self.storage_path.clone(),
@@ -575,6 +607,8 @@ fn create_new_archive(config: RecorderConfig) -> Result<ArchiveRecorder, Archive
             commit_log_file,
             commit_log_write_offset,
             commit_log_preallocated_len,
+            commit_log_buffer: Vec::new(),
+            commit_log_buffer_write_offset: commit_log_write_offset,
             commit_log_roll_index: 1,
             active_segment: None,
         }),
@@ -804,6 +838,8 @@ fn recover_existing_archive(
             commit_log_file,
             commit_log_write_offset,
             commit_log_preallocated_len,
+            commit_log_buffer: Vec::new(),
+            commit_log_buffer_write_offset: commit_log_write_offset,
             commit_log_roll_index: 1,
             active_segment: None,
         }),
@@ -1305,6 +1341,7 @@ impl ArchiveRecorder {
 
     /// Flushes recorder output streams.
     pub fn flush(&mut self) -> Result<(), ArchiveRecorderError> {
+        self.flush_commit_log_buffer()?;
         if let Some(disk) = self.disk.as_mut() {
             let io_backend = &mut self.io_backend;
 
@@ -1364,13 +1401,42 @@ impl ArchiveRecorder {
         user_header: &[u8],
         payload: &[u8],
     ) -> Result<RecordedCommit, ArchiveRecorderError> {
-        let adapted_user_header = encode_adapter_user_header(source_metadata, user_header);
         self.append_record_internal(
             RecordInput {
                 sequence: self.next_pattern_adapter_sequence()?,
                 event_time_ns,
-                user_header: &adapted_user_header,
-                payload,
+                user_header: EncodedUserHeader::Adapter {
+                    source_metadata,
+                    user_header,
+                },
+                payload: RecordPayload::Borrowed(payload),
+            },
+            source_metadata,
+        )
+    }
+
+    pub(super) unsafe fn append_adapted_external_payload_record(
+        &mut self,
+        source_metadata: ArchiveSourceMetadata,
+        event_time_ns: u64,
+        user_header: &[u8],
+        payload_ptr: *const u8,
+        payload_len: usize,
+        payload_owner: Box<dyn core::any::Any>,
+    ) -> Result<RecordedCommit, ArchiveRecorderError> {
+        self.append_record_internal(
+            RecordInput {
+                sequence: self.next_pattern_adapter_sequence()?,
+                event_time_ns,
+                user_header: EncodedUserHeader::Adapter {
+                    source_metadata,
+                    user_header,
+                },
+                payload: RecordPayload::External {
+                    ptr: payload_ptr,
+                    len: payload_len,
+                    owner: payload_owner,
+                },
             },
             source_metadata,
         )
@@ -1399,7 +1465,7 @@ impl ArchiveRecorder {
             event_time_ns: input.event_time_ns,
             commit_time_ns,
             user_header: input.user_header.to_vec(),
-            payload: input.payload.to_vec(),
+            payload: unsafe { input.payload.as_slice() }.to_vec(),
             locator,
         });
         self.stats.committed_records += 1;
@@ -1419,20 +1485,13 @@ impl ArchiveRecorder {
         source_metadata: ArchiveSourceMetadata,
     ) -> Result<RecordedCommit, ArchiveRecorderError> {
         let commit_time_ns = now_ns();
-        let frame = EncodedFrame::new(
-            commit_ordinal,
-            input.sequence,
-            input.event_time_ns,
-            commit_time_ns,
-            input.user_header,
-            input.payload,
-            self.config.checksum_mode,
-        );
-
+        let payload_len = input.payload.len();
+        let user_header_len = input.user_header.len();
+        let frame_len = align_up(FRAME_HEADER_LEN + user_header_len + payload_len, 8);
         let max_frame_bytes = self.config.segment_bytes - ARCHIVE_FILE_HEADER_V1_LEN;
-        if frame.bytes.len() > max_frame_bytes {
+        if frame_len > max_frame_bytes {
             return Err(ArchiveRecorderError::FrameTooLarge {
-                required: frame.bytes.len(),
+                required: frame_len,
                 segment_bytes: self.config.segment_bytes,
             });
         }
@@ -1443,7 +1502,7 @@ impl ArchiveRecorder {
             .as_mut()
             .expect("active segment must exist");
 
-        if (active.write_offset as usize + frame.bytes.len()) > self.config.segment_bytes {
+        if (active.write_offset as usize + frame_len) > self.config.segment_bytes {
             self.seal_active_segment_internal(true)?;
         }
 
@@ -1458,7 +1517,7 @@ impl ArchiveRecorder {
                     segment_id: active.segment_id,
                     segment_generation: active.segment_generation,
                     file_offset: active.write_offset,
-                    frame_len: frame.bytes.len() as u32,
+                    frame_len: frame_len as u32,
                 },
                 segment_data_path(
                     &disk.segments_path,
@@ -1468,22 +1527,100 @@ impl ArchiveRecorder {
             )
         };
 
-        let write_result = {
-            let (io_backend, disk) = (
-                &mut self.io_backend,
-                self.disk.as_mut().expect("disk recorder state must exist"),
-            );
-            let active = disk
-                .active_segment
-                .as_mut()
-                .expect("active segment must exist");
-            io_backend.write_all_at(
-                &mut active.file,
-                &segment_path,
-                locator.file_offset,
-                &frame.bytes,
-                "write active segment",
-            )
+        let (write_result, frame_checksum) = match input.payload {
+            RecordPayload::External { ptr, len, owner } => {
+                let mut header = encode_frame_header(
+                    commit_ordinal,
+                    input.sequence,
+                    input.event_time_ns,
+                    commit_time_ns,
+                    user_header_len,
+                    len,
+                    frame_len,
+                    self.config.checksum_mode,
+                    0,
+                );
+                let user_header = input.user_header.to_vec();
+                let padding_len = frame_len - FRAME_HEADER_LEN - user_header_len - len;
+                let owned_suffix =
+                    (padding_len > 0).then(|| vec![0u8; padding_len].into_boxed_slice());
+                let frame_checksum = if self.config.checksum_mode == ChecksumMode::Crc32c {
+                    let mut crc = crc32c::crc32c_append(0, &header);
+                    if !user_header.is_empty() {
+                        crc = crc32c::crc32c_append(crc, &user_header);
+                    }
+                    if len > 0 {
+                        let payload = unsafe { core::slice::from_raw_parts(ptr, len) };
+                        crc = crc32c::crc32c_append(crc, payload);
+                    }
+                    if let Some(suffix) = &owned_suffix {
+                        crc = crc32c::crc32c_append(crc, suffix);
+                    }
+                    header[FRAME_OFFSET_CHECKSUM..FRAME_OFFSET_CHECKSUM + 4]
+                        .copy_from_slice(&crc.to_le_bytes());
+                    crc
+                } else {
+                    0
+                };
+                let mut owned_prefixes = vec![Box::new(header) as Box<[u8]>];
+                if user_header_len > 0 {
+                    owned_prefixes.push(user_header.into_boxed_slice());
+                }
+                let result = {
+                    let (io_backend, disk) = (
+                        &mut self.io_backend,
+                        self.disk.as_mut().expect("disk recorder state must exist"),
+                    );
+                    let active = disk
+                        .active_segment
+                        .as_mut()
+                        .expect("active segment must exist");
+                    unsafe {
+                        io_backend.write_vectored_external_at(
+                            &mut active.file,
+                            &segment_path,
+                            locator.file_offset,
+                            owned_prefixes,
+                            ptr,
+                            len,
+                            owned_suffix,
+                            owner,
+                            "write active segment",
+                        )
+                    }
+                };
+                (result, frame_checksum)
+            }
+            payload => {
+                let frame = EncodedFrame::new(
+                    commit_ordinal,
+                    input.sequence,
+                    input.event_time_ns,
+                    commit_time_ns,
+                    input.user_header,
+                    unsafe { payload.as_slice() },
+                    self.config.checksum_mode,
+                );
+                let checksum = frame.checksum;
+                let result = {
+                    let (io_backend, disk) = (
+                        &mut self.io_backend,
+                        self.disk.as_mut().expect("disk recorder state must exist"),
+                    );
+                    let active = disk
+                        .active_segment
+                        .as_mut()
+                        .expect("active segment must exist");
+                    io_backend.write_owned_at(
+                        &mut active.file,
+                        &segment_path,
+                        locator.file_offset,
+                        frame.bytes.into_boxed_slice(),
+                        "write active segment",
+                    )
+                };
+                (result, checksum)
+            }
         };
         if let Err(source) = write_result {
             return Err(self.handle_commit_write_failure(source));
@@ -1495,7 +1632,7 @@ impl ArchiveRecorder {
                 .active_segment
                 .as_mut()
                 .expect("active segment must exist");
-            active.write_offset += frame.bytes.len() as u64;
+            active.write_offset += frame_len as u64;
             active.sequence_start.get_or_insert(input.sequence);
             active.sequence_end = Some(input.sequence);
             active.records += 1;
@@ -1506,22 +1643,11 @@ impl ArchiveRecorder {
         if commit_log_resized {
             self.enforce_metadata_log_cap()?;
         }
-        let commit_log_path = self
-            .disk
-            .as_ref()
-            .expect("disk recorder state must exist")
-            .commit_log_path
-            .clone();
-        let write_offset = self
-            .disk
-            .as_ref()
-            .expect("disk recorder state must exist")
-            .commit_log_write_offset;
         let commit_entry_bytes = encode_commit_entry(CommitEntry {
             commit_ordinal,
             sequence: input.sequence,
             locator,
-            frame_checksum: frame.checksum,
+            frame_checksum,
             event_time_ns: input.event_time_ns,
             commit_time_ns,
             source_pattern: source_metadata.source_pattern,
@@ -1529,32 +1655,12 @@ impl ArchiveRecorder {
             source_instance_id: source_metadata.source_instance_id,
             source_sequence: source_metadata.source_sequence,
         });
-        let write_result = {
-            let (io_backend, disk) = (
-                &mut self.io_backend,
-                self.disk.as_mut().expect("disk recorder state must exist"),
-            );
-            io_backend.write_all_at(
-                &mut disk.commit_log_file,
-                &commit_log_path,
-                write_offset,
-                &commit_entry_bytes,
-                "append commit idxlog entry",
-            )
-        };
-        if let Err(source) = write_result {
-            return Err(self.handle_commit_write_failure(source));
-        }
-        self.disk
-            .as_mut()
-            .expect("disk recorder state must exist")
-            .commit_log_write_offset += COMMIT_ENTRY_LEN as u64;
+        self.append_commit_log_entry(commit_entry_bytes)?;
 
         self.stats.committed_records += 1;
-        self.stats.payload_bytes_committed += input.payload.len() as u64;
-        self.stats.data_bytes_written += frame.bytes.len() as u64;
+        self.stats.payload_bytes_committed += payload_len as u64;
+        self.stats.data_bytes_written += frame_len as u64;
         self.stats.metadata_bytes_written += COMMIT_ENTRY_LEN as u64;
-        self.index_by_sequence.insert(input.sequence, locator);
 
         let commit = RecordedCommit {
             commit_ordinal,
@@ -1598,6 +1704,51 @@ impl ArchiveRecorder {
 
         self.degraded = true;
         source
+    }
+
+    fn append_commit_log_entry(
+        &mut self,
+        entry: [u8; COMMIT_ENTRY_LEN],
+    ) -> Result<(), ArchiveRecorderError> {
+        let should_flush = {
+            let disk = self.disk.as_mut().expect("disk recorder state must exist");
+            if disk.commit_log_buffer.is_empty() {
+                disk.commit_log_buffer_write_offset = disk.commit_log_write_offset;
+            }
+            disk.commit_log_buffer.extend_from_slice(&entry);
+            disk.commit_log_write_offset += COMMIT_ENTRY_LEN as u64;
+            self.config.persistence_mode == PersistenceMode::Sync
+                || disk.commit_log_buffer.len() >= COMMIT_LOG_BATCH_ENTRIES * COMMIT_ENTRY_LEN
+        };
+
+        if should_flush {
+            self.flush_commit_log_buffer()?;
+        }
+        Ok(())
+    }
+
+    fn flush_commit_log_buffer(&mut self) -> Result<(), ArchiveRecorderError> {
+        let Some(disk) = self.disk.as_mut() else {
+            return Ok(());
+        };
+        if disk.commit_log_buffer.is_empty() {
+            return Ok(());
+        }
+
+        let bytes = core::mem::take(&mut disk.commit_log_buffer).into_boxed_slice();
+        let write_offset = disk.commit_log_buffer_write_offset;
+        disk.commit_log_buffer_write_offset = disk.commit_log_write_offset;
+        let result = self.io_backend.write_owned_at(
+            &mut disk.commit_log_file,
+            &disk.commit_log_path,
+            write_offset,
+            bytes,
+            "append commit idxlog batch",
+        );
+        if let Err(source) = result {
+            return Err(self.handle_commit_write_failure(source));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1671,6 +1822,7 @@ impl ArchiveRecorder {
             return Ok(());
         }
 
+        self.flush_commit_log_buffer()?;
         {
             let disk = self.disk.as_mut().expect("disk recorder state must exist");
             self.io_backend.flush(
@@ -1729,6 +1881,8 @@ impl ArchiveRecorder {
             disk.commit_log_path = commit_log_path;
             disk.commit_log_write_offset = commit_log_write_offset;
             disk.commit_log_preallocated_len = commit_log_preallocated_len;
+            disk.commit_log_buffer.clear();
+            disk.commit_log_buffer_write_offset = commit_log_write_offset;
             disk.commit_log_roll_index = roll_index.saturating_add(1);
         }
         self.stats.metadata_log_rolls = self.stats.metadata_log_rolls.saturating_add(1);
@@ -1771,6 +1925,7 @@ impl ArchiveRecorder {
     }
 
     fn truncate_commit_log_to_logical_size(&mut self) -> Result<(), ArchiveRecorderError> {
+        self.flush_commit_log_buffer()?;
         let Some(disk) = self.disk.as_mut() else {
             return Ok(());
         };
@@ -2220,6 +2375,7 @@ impl ArchiveRecorder {
     }
 
     fn sync_commit_log_and_catalog(&mut self) -> Result<(), ArchiveRecorderError> {
+        self.flush_commit_log_buffer()?;
         let disk = self
             .disk
             .as_mut()
@@ -2240,6 +2396,7 @@ impl ArchiveRecorder {
     }
 
     fn sync_data_files(&mut self) -> Result<(), ArchiveRecorderError> {
+        self.flush_commit_log_buffer()?;
         let disk = self.disk.as_mut().expect("disk state must exist");
         let io_backend = &mut self.io_backend;
         if let Some(active) = disk.active_segment.as_mut() {

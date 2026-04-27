@@ -80,11 +80,13 @@ iox2-log-replay replay [COMMON_OPTIONS] <SELECTOR_COMMAND>
 - `locator --at <segment_id>:<segment_generation>:<file_offset>:<frame_len>`
 - `selectors --stdin --selector-format ndjson|csv`
 - `selectors --file <path> --selector-format ndjson|csv`
+- `all`
 
 Design intent:
 - A selector command is always required.
 - Selector commands are structurally exclusive by CLI shape (no flag-level exclusion matrix).
-- `selectors` is the only mode that accepts multi-record selector streams.
+- `all` replays every available record in archive sequence order.
+- `selectors` is the only mode that accepts external multi-record selector streams.
 
 ### Destinations
 - `--to publish-subscribe --service <name>`
@@ -246,9 +248,9 @@ iox2-log-query query locate-window \
   - retired `log` destination returns deterministic unsupported errors if exposed,
   - payload/user-header bytes match archived frames.
 
-### Phase 4: Rate Control + Streaming Robustness (Completed 2026-02-09)
+### Phase 4: Rate Control + Streaming Robustness (Completed 2026-02-09; refreshed 2026-04-27)
 - Implement `fast`, `recorded`, `fixed` pacing.
-- Add bounded buffering for stdin selectors.
+- Stream stdin/file selectors incrementally without loading the full selector set into memory.
 - Add `--skip-missing` and `--max-errors` handling.
 - Exit criteria:
   - recorded/fixed pacing tests pass within tolerance,

@@ -10,6 +10,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Seek, SeekFrom, Write};
@@ -28,9 +29,26 @@ struct PendingWrite {
     fd: RawFd,
     offset: u64,
     written: usize,
-    buffer: Box<[u8]>,
+    kind: PendingWriteKind,
     operation: &'static str,
     path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum PendingWriteKind {
+    Contiguous {
+        buffer: Box<[u8]>,
+    },
+    Vectored {
+        owned_prefixes: Vec<Box<[u8]>>,
+        external_ptr: *const u8,
+        external_len: usize,
+        owned_suffix: Option<Box<[u8]>>,
+        iovecs: Box<[libc::iovec]>,
+        total_len: usize,
+        _owner: Box<dyn Any>,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -177,6 +195,93 @@ impl RecorderIoBackend {
         }
     }
 
+    pub(super) fn write_owned_at(
+        &mut self,
+        file: &mut File,
+        path: &Path,
+        offset: u64,
+        bytes: Box<[u8]>,
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
+        match self {
+            Self::Blocking(_) => file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| file.write_all(&bytes))
+                .map_err(|source| ArchiveRecorderError::Io {
+                    operation,
+                    path: path.to_path_buf(),
+                    source,
+                }),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(backend) => {
+                backend.enqueue_owned_write(file, path, offset, bytes, operation)
+            }
+        }
+    }
+
+    pub(super) unsafe fn write_vectored_external_at(
+        &mut self,
+        file: &mut File,
+        path: &Path,
+        offset: u64,
+        owned_prefixes: Vec<Box<[u8]>>,
+        external_ptr: *const u8,
+        external_len: usize,
+        owned_suffix: Option<Box<[u8]>>,
+        owner: Box<dyn Any>,
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
+        match self {
+            Self::Blocking(_) => {
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|source| ArchiveRecorderError::Io {
+                        operation,
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                for prefix in &owned_prefixes {
+                    file.write_all(prefix)
+                        .map_err(|source| ArchiveRecorderError::Io {
+                            operation,
+                            path: path.to_path_buf(),
+                            source,
+                        })?;
+                }
+                let payload = unsafe { core::slice::from_raw_parts(external_ptr, external_len) };
+                file.write_all(payload)
+                    .map_err(|source| ArchiveRecorderError::Io {
+                        operation,
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                if let Some(suffix) = &owned_suffix {
+                    file.write_all(suffix)
+                        .map_err(|source| ArchiveRecorderError::Io {
+                            operation,
+                            path: path.to_path_buf(),
+                            source,
+                        })?;
+                }
+                drop(owner);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Self::IoUring(backend) => unsafe {
+                backend.enqueue_vectored_external_write(
+                    file,
+                    path,
+                    offset,
+                    owned_prefixes,
+                    external_ptr,
+                    external_len,
+                    owned_suffix,
+                    owner,
+                    operation,
+                )
+            },
+        }
+    }
+
     pub(super) fn flush(
         &mut self,
         file: &mut File,
@@ -259,6 +364,23 @@ impl IoUringBackend {
         bytes: &[u8],
         operation: &'static str,
     ) -> Result<(), ArchiveRecorderError> {
+        self.enqueue_owned_write(
+            file,
+            path,
+            offset,
+            bytes.to_vec().into_boxed_slice(),
+            operation,
+        )
+    }
+
+    fn enqueue_owned_write(
+        &mut self,
+        file: &File,
+        path: &Path,
+        offset: u64,
+        bytes: Box<[u8]>,
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -269,7 +391,71 @@ impl IoUringBackend {
             fd: file.as_raw_fd(),
             offset,
             written: 0,
-            buffer: bytes.to_vec().into_boxed_slice(),
+            kind: PendingWriteKind::Contiguous { buffer: bytes },
+            operation,
+            path: path.to_path_buf(),
+        };
+        self.pending_writes.insert(user_data, pending);
+        self.push_write_entry(user_data)?;
+
+        if self.pending_submit_count >= self.submit_batch_max {
+            self.submit_pending()?;
+        }
+
+        if self.pending_writes.len() >= self.queue_depth as usize {
+            self.submit_pending()?;
+            self.wait_for_and_reap(1)?;
+        } else {
+            self.reap_completed()?;
+        }
+
+        Ok(())
+    }
+
+    unsafe fn enqueue_vectored_external_write(
+        &mut self,
+        file: &File,
+        path: &Path,
+        offset: u64,
+        owned_prefixes: Vec<Box<[u8]>>,
+        external_ptr: *const u8,
+        external_len: usize,
+        owned_suffix: Option<Box<[u8]>>,
+        owner: Box<dyn Any>,
+        operation: &'static str,
+    ) -> Result<(), ArchiveRecorderError> {
+        let total_len = owned_prefixes
+            .iter()
+            .map(|buffer| buffer.len())
+            .sum::<usize>()
+            + external_len
+            + owned_suffix.as_ref().map_or(0, |buffer| buffer.len());
+        if total_len == 0 {
+            return Ok(());
+        }
+
+        let user_data = self.next_user_data;
+        self.next_user_data = self.next_user_data.wrapping_add(1);
+        let iovecs = build_iovecs(
+            &owned_prefixes,
+            external_ptr,
+            external_len,
+            owned_suffix.as_deref(),
+            0,
+        );
+        let pending = PendingWrite {
+            fd: file.as_raw_fd(),
+            offset,
+            written: 0,
+            kind: PendingWriteKind::Vectored {
+                owned_prefixes,
+                external_ptr,
+                external_len,
+                owned_suffix,
+                iovecs,
+                total_len,
+                _owner: owner,
+            },
             operation,
             path: path.to_path_buf(),
         };
@@ -398,21 +584,54 @@ impl IoUringBackend {
         let pending = self.pending_writes.get(&user_data).ok_or({
             ArchiveRecorderError::RecoveryInconsistent("missing io_uring pending write state")
         })?;
-        let remaining = pending.buffer.len().checked_sub(pending.written).ok_or(
-            ArchiveRecorderError::RecoveryInconsistent("io_uring pending write underflow"),
-        )?;
-        let ptr = pending.buffer[pending.written..].as_ptr();
         let offset = pending.offset + pending.written as u64;
-        let entry = if let Some(index) = self.registered_file_slots.get(&pending.fd) {
-            io_uring::opcode::Write::new(io_uring::types::Fixed(*index), ptr, remaining as _)
-                .offset(offset)
-                .build()
-                .user_data(user_data)
-        } else {
-            io_uring::opcode::Write::new(io_uring::types::Fd(pending.fd), ptr, remaining as _)
-                .offset(offset)
-                .build()
-                .user_data(user_data)
+        let entry = match &pending.kind {
+            PendingWriteKind::Contiguous { buffer } => {
+                let remaining = buffer.len().checked_sub(pending.written).ok_or(
+                    ArchiveRecorderError::RecoveryInconsistent("io_uring pending write underflow"),
+                )?;
+                let ptr = buffer[pending.written..].as_ptr();
+                if let Some(index) = self.registered_file_slots.get(&pending.fd) {
+                    io_uring::opcode::Write::new(
+                        io_uring::types::Fixed(*index),
+                        ptr,
+                        remaining as _,
+                    )
+                    .offset(offset)
+                    .build()
+                    .user_data(user_data)
+                } else {
+                    io_uring::opcode::Write::new(
+                        io_uring::types::Fd(pending.fd),
+                        ptr,
+                        remaining as _,
+                    )
+                    .offset(offset)
+                    .build()
+                    .user_data(user_data)
+                }
+            }
+            PendingWriteKind::Vectored { iovecs, .. } => {
+                if let Some(index) = self.registered_file_slots.get(&pending.fd) {
+                    io_uring::opcode::Writev::new(
+                        io_uring::types::Fixed(*index),
+                        iovecs.as_ptr(),
+                        iovecs.len() as _,
+                    )
+                    .offset(offset)
+                    .build()
+                    .user_data(user_data)
+                } else {
+                    io_uring::opcode::Writev::new(
+                        io_uring::types::Fd(pending.fd),
+                        iovecs.as_ptr(),
+                        iovecs.len() as _,
+                    )
+                    .offset(offset)
+                    .build()
+                    .user_data(user_data)
+                }
+            }
         };
         Ok(entry)
     }
@@ -472,7 +691,9 @@ impl IoUringBackend {
             }
 
             pending.written += result as usize;
-            if pending.written < pending.buffer.len() {
+            let total_len = pending_total_len(&pending);
+            if pending.written < total_len {
+                refresh_pending_iovecs(&mut pending);
                 self.pending_writes.insert(user_data, pending);
                 self.push_write_entry(user_data)?;
             }
@@ -506,4 +727,69 @@ impl IoUringBackend {
         };
         Ok(cqe.result())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn pending_total_len(pending: &PendingWrite) -> usize {
+    match &pending.kind {
+        PendingWriteKind::Contiguous { buffer } => buffer.len(),
+        PendingWriteKind::Vectored { total_len, .. } => *total_len,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn refresh_pending_iovecs(pending: &mut PendingWrite) {
+    if let PendingWriteKind::Vectored {
+        owned_prefixes,
+        external_ptr,
+        external_len,
+        owned_suffix,
+        iovecs,
+        ..
+    } = &mut pending.kind
+    {
+        *iovecs = build_iovecs(
+            owned_prefixes,
+            *external_ptr,
+            *external_len,
+            owned_suffix.as_deref(),
+            pending.written,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_iovecs(
+    owned_prefixes: &[Box<[u8]>],
+    external_ptr: *const u8,
+    external_len: usize,
+    owned_suffix: Option<&[u8]>,
+    mut skip: usize,
+) -> Box<[libc::iovec]> {
+    let mut iovecs = Vec::new();
+    for buffer in owned_prefixes {
+        push_iovec(&mut iovecs, buffer.as_ptr(), buffer.len(), &mut skip);
+    }
+    push_iovec(&mut iovecs, external_ptr, external_len, &mut skip);
+    if let Some(suffix) = owned_suffix {
+        push_iovec(&mut iovecs, suffix.as_ptr(), suffix.len(), &mut skip);
+    }
+    iovecs.into_boxed_slice()
+}
+
+#[cfg(target_os = "linux")]
+fn push_iovec(iovecs: &mut Vec<libc::iovec>, ptr: *const u8, len: usize, skip: &mut usize) {
+    if len == 0 {
+        return;
+    }
+    if *skip >= len {
+        *skip -= len;
+        return;
+    }
+    let offset = *skip;
+    *skip = 0;
+    iovecs.push(libc::iovec {
+        iov_base: unsafe { ptr.add(offset) }.cast_mut().cast(),
+        iov_len: len - offset,
+    });
 }

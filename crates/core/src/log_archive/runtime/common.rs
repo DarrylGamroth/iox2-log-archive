@@ -317,6 +317,29 @@ pub struct PublishSubscribeRecordInput<'a> {
     pub payload: &'a [u8],
 }
 
+/// Input frame for publish-subscribe ingestion with externally-owned payload storage.
+///
+/// The caller must keep `payload_ptr` valid through `payload_owner`; the recorder
+/// owns and drops that guard after asynchronous writes complete.
+pub struct PublishSubscribeExternalPayloadInput<'a> {
+    /// Event timestamp in nanoseconds.
+    pub event_time_ns: u64,
+    /// Stable source service identity chosen by caller.
+    pub source_service_id: u64,
+    /// Stable source publisher identity chosen by caller.
+    pub source_publisher_id: u64,
+    /// Optional source sequence from publisher-side metadata.
+    pub source_sequence: Option<u64>,
+    /// User header bytes.
+    pub user_header: &'a [u8],
+    /// Raw payload pointer.
+    pub payload_ptr: *const u8,
+    /// Payload length in bytes.
+    pub payload_len: usize,
+    /// Owner that keeps `payload_ptr` valid until recorder I/O completes.
+    pub payload_owner: Box<dyn core::any::Any>,
+}
+
 /// Adapter user-header decode output.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DecodedAdapterUserHeader<'a> {
@@ -332,6 +355,16 @@ pub fn encode_adapter_user_header(
     user_header: &[u8],
 ) -> Vec<u8> {
     let mut bytes = vec![0u8; ADAPTER_USER_HEADER_PREFIX_LEN + user_header.len()];
+    bytes[..ADAPTER_USER_HEADER_PREFIX_LEN]
+        .copy_from_slice(&encode_adapter_user_header_prefix(source_metadata));
+    bytes[ADAPTER_USER_HEADER_PREFIX_LEN..].copy_from_slice(user_header);
+    bytes
+}
+
+pub(super) fn encode_adapter_user_header_prefix(
+    source_metadata: ArchiveSourceMetadata,
+) -> [u8; ADAPTER_USER_HEADER_PREFIX_LEN] {
+    let mut bytes = [0u8; ADAPTER_USER_HEADER_PREFIX_LEN];
     bytes[ADAPTER_USER_HEADER_OFFSET_MAGIC..ADAPTER_USER_HEADER_OFFSET_MAGIC + 4]
         .copy_from_slice(&ADAPTER_USER_HEADER_MAGIC);
     bytes[ADAPTER_USER_HEADER_OFFSET_LEN..ADAPTER_USER_HEADER_OFFSET_LEN + 2]
@@ -352,7 +385,6 @@ pub fn encode_adapter_user_header(
     bytes[ADAPTER_USER_HEADER_OFFSET_SOURCE_SEQUENCE
         ..ADAPTER_USER_HEADER_OFFSET_SOURCE_SEQUENCE + 8]
         .copy_from_slice(&source_metadata.source_sequence.unwrap_or(0).to_le_bytes());
-    bytes[ADAPTER_USER_HEADER_PREFIX_LEN..].copy_from_slice(user_header);
     bytes
 }
 
@@ -492,8 +524,75 @@ pub struct ReplayedFrame {
     pub user_header: Vec<u8>,
     /// Payload bytes.
     pub payload: Vec<u8>,
+    /// Verified frame checksum, or zero when the frame has no checksum.
+    pub frame_checksum: u32,
     /// Physical locator.
     pub locator: ArchiveLocator,
+}
+
+/// Reusable storage for borrowed replay reads.
+///
+/// Use this with `ArchiveReplayer::*_into` APIs to avoid allocating and copying
+/// separate user-header and payload `Vec`s for every frame.
+#[derive(Debug, Default)]
+pub struct ReplayFrameBuffer {
+    pub(super) variable: Vec<u8>,
+}
+
+impl ReplayFrameBuffer {
+    /// Creates an empty replay buffer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates an empty replay buffer with at least `capacity` bytes reserved.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            variable: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Returns the reusable variable-region capacity in bytes.
+    pub fn capacity(&self) -> usize {
+        self.variable.capacity()
+    }
+}
+
+/// Borrowed decoded frame returned by zero-copy replay APIs.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReplayedFrameView<'a> {
+    /// Commit ordinal from archive.
+    pub commit_ordinal: u64,
+    /// Source sequence.
+    pub sequence: u64,
+    /// Event timestamp in nanoseconds.
+    pub event_time_ns: u64,
+    /// Commit timestamp in nanoseconds.
+    pub commit_time_ns: u64,
+    /// User header bytes borrowed from the replay buffer.
+    pub user_header: &'a [u8],
+    /// Payload bytes borrowed from the replay buffer.
+    pub payload: &'a [u8],
+    /// Verified frame checksum, or zero when the frame has no checksum.
+    pub frame_checksum: u32,
+    /// Physical locator.
+    pub locator: ArchiveLocator,
+}
+
+impl ReplayedFrameView<'_> {
+    /// Converts this borrowed frame into the owned replay frame type.
+    pub fn to_owned_frame(&self) -> ReplayedFrame {
+        ReplayedFrame {
+            commit_ordinal: self.commit_ordinal,
+            sequence: self.sequence,
+            event_time_ns: self.event_time_ns,
+            commit_time_ns: self.commit_time_ns,
+            user_header: self.user_header.to_vec(),
+            payload: self.payload.to_vec(),
+            frame_checksum: self.frame_checksum,
+            locator: self.locator,
+        }
+    }
 }
 
 /// Errors returned by archive recorder operations.
@@ -675,6 +774,8 @@ pub(super) struct DiskRecorderState {
     pub(super) commit_log_file: File,
     pub(super) commit_log_write_offset: u64,
     pub(super) commit_log_preallocated_len: u64,
+    pub(super) commit_log_buffer: Vec<u8>,
+    pub(super) commit_log_buffer_write_offset: u64,
     pub(super) commit_log_roll_index: u64,
     pub(super) active_segment: Option<ActiveSegment>,
 }
@@ -803,17 +904,53 @@ pub(super) struct EncodedFrame {
     pub(super) checksum: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum EncodedUserHeader<'a> {
+    Adapter {
+        source_metadata: ArchiveSourceMetadata,
+        user_header: &'a [u8],
+    },
+}
+
+impl EncodedUserHeader<'_> {
+    pub(super) fn len(self) -> usize {
+        match self {
+            Self::Adapter { user_header, .. } => ADAPTER_USER_HEADER_PREFIX_LEN + user_header.len(),
+        }
+    }
+
+    pub(super) fn copy_to(self, output: &mut [u8]) {
+        match self {
+            Self::Adapter {
+                source_metadata,
+                user_header,
+            } => {
+                output[..ADAPTER_USER_HEADER_PREFIX_LEN]
+                    .copy_from_slice(&encode_adapter_user_header_prefix(source_metadata));
+                output[ADAPTER_USER_HEADER_PREFIX_LEN..].copy_from_slice(user_header);
+            }
+        }
+    }
+
+    pub(super) fn to_vec(self) -> Vec<u8> {
+        let mut bytes = vec![0u8; self.len()];
+        self.copy_to(&mut bytes);
+        bytes
+    }
+}
+
 impl EncodedFrame {
     pub(super) fn new(
         commit_ordinal: u64,
         sequence: u64,
         event_time_ns: u64,
         commit_time_ns: u64,
-        user_header: &[u8],
+        user_header: EncodedUserHeader<'_>,
         payload: &[u8],
         checksum_mode: ChecksumMode,
     ) -> Self {
-        let frame_len = align_up(FRAME_HEADER_LEN + user_header.len() + payload.len(), 8);
+        let user_header_len = user_header.len();
+        let frame_len = align_up(FRAME_HEADER_LEN + user_header_len + payload.len(), 8);
         let mut bytes = vec![0u8; frame_len];
         bytes[FRAME_OFFSET_MAGIC..FRAME_OFFSET_MAGIC + 4].copy_from_slice(&FRAME_MAGIC);
         bytes[FRAME_OFFSET_HEADER_LEN..FRAME_OFFSET_HEADER_LEN + 2]
@@ -834,12 +971,12 @@ impl EncodedFrame {
         bytes[FRAME_OFFSET_COMMIT_TIME_NS..FRAME_OFFSET_COMMIT_TIME_NS + 8]
             .copy_from_slice(&commit_time_ns.to_le_bytes());
         bytes[FRAME_OFFSET_USER_HEADER_LEN..FRAME_OFFSET_USER_HEADER_LEN + 4]
-            .copy_from_slice(&(user_header.len() as u32).to_le_bytes());
+            .copy_from_slice(&(user_header_len as u32).to_le_bytes());
         bytes[FRAME_OFFSET_PAYLOAD_LEN..FRAME_OFFSET_PAYLOAD_LEN + 4]
             .copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        bytes[FRAME_HEADER_LEN..FRAME_HEADER_LEN + user_header.len()].copy_from_slice(user_header);
-        bytes[FRAME_HEADER_LEN + user_header.len()
-            ..FRAME_HEADER_LEN + user_header.len() + payload.len()]
+        user_header.copy_to(&mut bytes[FRAME_HEADER_LEN..FRAME_HEADER_LEN + user_header_len]);
+        bytes[FRAME_HEADER_LEN + user_header_len
+            ..FRAME_HEADER_LEN + user_header_len + payload.len()]
             .copy_from_slice(payload);
 
         let checksum = if checksum_mode == ChecksumMode::Crc32c {
@@ -853,6 +990,45 @@ impl EncodedFrame {
 
         Self { bytes, checksum }
     }
+}
+
+pub(super) fn encode_frame_header(
+    commit_ordinal: u64,
+    sequence: u64,
+    event_time_ns: u64,
+    commit_time_ns: u64,
+    user_header_len: usize,
+    payload_len: usize,
+    frame_len: usize,
+    checksum_mode: ChecksumMode,
+    checksum: u32,
+) -> [u8; FRAME_HEADER_LEN] {
+    let mut bytes = [0u8; FRAME_HEADER_LEN];
+    bytes[FRAME_OFFSET_MAGIC..FRAME_OFFSET_MAGIC + 4].copy_from_slice(&FRAME_MAGIC);
+    bytes[FRAME_OFFSET_HEADER_LEN..FRAME_OFFSET_HEADER_LEN + 2]
+        .copy_from_slice(&(FRAME_HEADER_LEN as u16).to_le_bytes());
+    let mut flags = 0u16;
+    if checksum_mode == ChecksumMode::Crc32c {
+        flags |= FRAME_FLAG_CHECKSUM_CRC32C;
+    }
+    bytes[FRAME_OFFSET_FLAGS..FRAME_OFFSET_FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
+    bytes[FRAME_OFFSET_FRAME_LEN..FRAME_OFFSET_FRAME_LEN + 4]
+        .copy_from_slice(&(frame_len as u32).to_le_bytes());
+    bytes[FRAME_OFFSET_COMMIT_ORDINAL..FRAME_OFFSET_COMMIT_ORDINAL + 8]
+        .copy_from_slice(&commit_ordinal.to_le_bytes());
+    bytes[FRAME_OFFSET_SEQUENCE..FRAME_OFFSET_SEQUENCE + 8]
+        .copy_from_slice(&sequence.to_le_bytes());
+    bytes[FRAME_OFFSET_EVENT_TIME_NS..FRAME_OFFSET_EVENT_TIME_NS + 8]
+        .copy_from_slice(&event_time_ns.to_le_bytes());
+    bytes[FRAME_OFFSET_COMMIT_TIME_NS..FRAME_OFFSET_COMMIT_TIME_NS + 8]
+        .copy_from_slice(&commit_time_ns.to_le_bytes());
+    bytes[FRAME_OFFSET_USER_HEADER_LEN..FRAME_OFFSET_USER_HEADER_LEN + 4]
+        .copy_from_slice(&(user_header_len as u32).to_le_bytes());
+    bytes[FRAME_OFFSET_PAYLOAD_LEN..FRAME_OFFSET_PAYLOAD_LEN + 4]
+        .copy_from_slice(&(payload_len as u32).to_le_bytes());
+    bytes[FRAME_OFFSET_CHECKSUM..FRAME_OFFSET_CHECKSUM + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+    bytes
 }
 
 pub(super) fn now_ns() -> u64 {
@@ -941,24 +1117,4 @@ pub(super) fn read_u64(bytes: &[u8], offset: usize) -> u64 {
         bytes[offset + 6],
         bytes[offset + 7],
     ])
-}
-
-pub(super) fn frame_crc_from_payload(
-    frame: &ReplayedFrame,
-    verify: bool,
-) -> Result<u32, ArchiveReplayError> {
-    if !verify {
-        return Ok(0);
-    }
-
-    let encoded = EncodedFrame::new(
-        frame.commit_ordinal,
-        frame.sequence,
-        frame.event_time_ns,
-        frame.commit_time_ns,
-        &frame.user_header,
-        &frame.payload,
-        ChecksumMode::Crc32c,
-    );
-    Ok(encoded.checksum)
 }

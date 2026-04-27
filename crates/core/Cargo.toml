@@ -20,6 +20,7 @@ getrandom = { version = "0.2.15", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.3"
+libc = "0.2"
 
 [dev-dependencies]
 iceoryx2-bb-testing = { workspace = true }

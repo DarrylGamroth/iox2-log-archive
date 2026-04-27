@@ -68,6 +68,7 @@ fn pubsub_recorder_accepts_live_control_commands() {
             io_cqe_batch_max: None,
             io_uring_register_files: None,
             checksum_mode: None,
+            subscriber_max_borrowed_samples: None,
             out_of_space_policy: None,
             metadata_log_roll_bytes: None,
             metadata_log_max_bytes: None,

@@ -39,7 +39,7 @@ pub struct Cli {
     pub format: Format,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+#[derive(Clone, Copy, Debug, ValueEnum, Default, PartialEq, Eq)]
 #[value(rename_all = "kebab-case")]
 pub enum CliRecorderProfile {
     Durable,
@@ -49,7 +49,7 @@ pub enum CliRecorderProfile {
     Replay,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+#[derive(Clone, Copy, Debug, ValueEnum, Default, PartialEq, Eq)]
 #[value(rename_all = "kebab-case")]
 pub enum CliPersistenceMode {
     Volatile,
@@ -107,17 +107,28 @@ pub struct LogRecordArchiveOptions {
     #[clap(long, value_enum, default_value_t = CliRecorderProfile::Balanced)]
     pub profile: CliRecorderProfile,
 
-    #[clap(long, value_enum, default_value_t = CliPersistenceMode::Async)]
-    pub mode: CliPersistenceMode,
+    #[clap(
+        long,
+        value_enum,
+        help = "Override persistence mode selected by --profile."
+    )]
+    pub mode: Option<CliPersistenceMode>,
 
-    #[clap(long, default_value = "268435456")]
-    pub segment_bytes: usize,
+    #[clap(long, help = "Override segment byte size selected by --profile.")]
+    pub segment_bytes: Option<usize>,
 
-    #[clap(long, default_value = "1")]
-    pub spare_preallocated_segments: usize,
+    #[clap(
+        long,
+        help = "Override number of spare preallocated segments selected by --profile."
+    )]
+    pub spare_preallocated_segments: Option<usize>,
 
-    #[clap(long, default_value_t = true, action = ArgAction::Set)]
-    pub segment_preallocate: bool,
+    #[clap(
+        long,
+        action = ArgAction::Set,
+        help = "Override segment preallocation selected by --profile."
+    )]
+    pub segment_preallocate: Option<bool>,
 
     #[clap(long)]
     pub max_disk_bytes: Option<u64>,
@@ -206,6 +217,12 @@ pub struct LogRecordRuntimeOptions {
 pub struct LogRecordPublishSubscribeRuntimeOptions {
     #[command(flatten)]
     pub common: LogRecordRuntimeOptions,
+
+    #[clap(
+        long,
+        help = "Minimum subscriber borrowed-sample capacity to request for zero-copy external-payload recording."
+    )]
+    pub subscriber_max_borrowed_samples: Option<usize>,
 
     #[clap(
         long,

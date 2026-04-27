@@ -545,6 +545,11 @@ fn locate_range(options: LocateRangeOptions, format: Format) -> Result<(), LogQu
             "--emit aligned is not supported by locate-range".to_string(),
         ));
     }
+    if options.expand_selectors && options.emit != QueryEmitMode::Selectors {
+        return Err(LogQueryCommandError::InvalidInput(
+            "--expand-selectors is only valid with --emit selectors".to_string(),
+        ));
+    }
 
     let sink = SqliteMetadataSink::open_for_stream(&options.db_path, &options.stream_id)
         .map_err(map_sink_error)?;
@@ -573,11 +578,20 @@ fn locate_range(options: LocateRangeOptions, format: Format) -> Result<(), LogQu
     }
 
     match options.emit {
-        QueryEmitMode::Selectors => print_ndjson(&RangeSelector {
-            kind: "range",
-            from: options.from,
-            count: options.count,
-        }),
+        QueryEmitMode::Selectors => {
+            if options.expand_selectors {
+                for record in &records {
+                    print_ndjson(&locator_selector(record.locator))?;
+                }
+                Ok(())
+            } else {
+                print_ndjson(&RangeSelector {
+                    kind: "range",
+                    from: options.from,
+                    count: options.count,
+                })
+            }
+        }
         QueryEmitMode::Summary => {
             let payload = QuerySummary {
                 operation: "locate-range",

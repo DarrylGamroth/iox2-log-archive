@@ -11,8 +11,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use alloc::collections::BTreeMap;
-use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::cmp::min;
 use core::num::NonZeroUsize;
 use std::fs::{self, File, OpenOptions};
@@ -103,6 +103,7 @@ impl ArchiveReplayerBuilder {
             cursor: 0,
             replay_budget: self.replay_budget,
             verify_checksums: self.verify_checksums,
+            segment_file_cache: RefCell::new(BTreeMap::new()),
         })
     }
 }
@@ -118,6 +119,7 @@ pub struct ArchiveReplayer {
     cursor: usize,
     replay_budget: ReplayBudget,
     verify_checksums: bool,
+    segment_file_cache: RefCell<BTreeMap<(u64, u32), File>>,
 }
 
 impl ArchiveReplayer {
@@ -225,6 +227,29 @@ impl ArchiveReplayer {
         self.read_frame_from_entry(entry)
     }
 
+    /// Reads a record by source sequence into a reusable replay buffer.
+    pub fn read_at_sequence_into<'a>(
+        &self,
+        sequence: u64,
+        buffer: &'a mut ReplayFrameBuffer,
+    ) -> Result<Option<ReplayedFrameView<'a>>, ArchiveReplayError> {
+        let Some(entry) = self.index_by_sequence.get(&sequence) else {
+            return Ok(None);
+        };
+        let frame = self.read_frame_into(entry.locator, buffer)?;
+        if self.verify_checksums
+            && entry.frame_checksum != 0
+            && frame.frame_checksum != entry.frame_checksum
+        {
+            return Err(ArchiveReplayError::ChecksumMismatch {
+                expected: entry.frame_checksum,
+                actual: frame.frame_checksum,
+                locator: frame.locator,
+            });
+        }
+        Ok(Some(frame))
+    }
+
     /// Reads multiple records starting from `start_sequence`.
     pub fn read_range(
         &self,
@@ -311,6 +336,16 @@ impl ArchiveReplayer {
         self.read_frame(locator)
     }
 
+    /// Reads one frame via physical locator into a reusable replay buffer.
+    pub fn read_at_locator_into<'a>(
+        &self,
+        locator: ArchiveLocator,
+        buffer: &'a mut ReplayFrameBuffer,
+    ) -> Result<ReplayedFrameView<'a>, ArchiveReplayError> {
+        validate_locator_input(locator)?;
+        self.read_frame_into(locator, buffer)
+    }
+
     /// Returns commit-log entries for CLI/admin introspection.
     ///
     /// Entries are ordered by `commit_ordinal`.
@@ -383,11 +418,11 @@ impl ArchiveReplayer {
         let frame = self.read_frame(entry.locator)?;
         if self.verify_checksums
             && entry.frame_checksum != 0
-            && frame_crc_from_payload(&frame, self.verify_checksums)? != entry.frame_checksum
+            && frame.frame_checksum != entry.frame_checksum
         {
             return Err(ArchiveReplayError::ChecksumMismatch {
                 expected: entry.frame_checksum,
-                actual: frame_crc_from_payload(&frame, self.verify_checksums)?,
+                actual: frame.frame_checksum,
                 locator: frame.locator,
             });
         }
@@ -395,20 +430,37 @@ impl ArchiveReplayer {
     }
 
     fn read_frame(&self, locator: ArchiveLocator) -> Result<ReplayedFrame, ArchiveReplayError> {
+        let mut buffer = ReplayFrameBuffer::new();
+        let frame = self.read_frame_into(locator, &mut buffer)?;
+        Ok(frame.to_owned_frame())
+    }
+
+    fn read_frame_into<'a>(
+        &self,
+        locator: ArchiveLocator,
+        buffer: &'a mut ReplayFrameBuffer,
+    ) -> Result<ReplayedFrameView<'a>, ArchiveReplayError> {
+        let segment_key = (locator.segment_id, locator.segment_generation);
         let segment_path = segment_data_path(
             &self.segments_path,
             locator.segment_id,
             locator.segment_generation,
         );
-        if !segment_path.exists() {
-            return Err(ArchiveReplayError::MissingSegment(segment_path));
-        }
-
-        let mut file = File::open(&segment_path).map_err(|source| ArchiveReplayError::Io {
-            operation: "open segment data",
-            path: segment_path.clone(),
-            source,
-        })?;
+        let mut file_cache = self.segment_file_cache.borrow_mut();
+        let file = match file_cache.entry(segment_key) {
+            alloc::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            alloc::collections::btree_map::Entry::Vacant(entry) => {
+                if !segment_path.exists() {
+                    return Err(ArchiveReplayError::MissingSegment(segment_path));
+                }
+                let file = File::open(&segment_path).map_err(|source| ArchiveReplayError::Io {
+                    operation: "open segment data",
+                    path: segment_path.clone(),
+                    source,
+                })?;
+                entry.insert(file)
+            }
+        };
         file.seek(SeekFrom::Start(locator.file_offset))
             .map_err(|source| ArchiveReplayError::Io {
                 operation: "seek segment frame",
@@ -448,8 +500,8 @@ impl ArchiveReplayer {
         }
 
         let variable_len = frame_len as usize - FRAME_HEADER_LEN;
-        let mut variable = vec![0u8; variable_len];
-        file.read_exact(&mut variable)
+        buffer.variable.resize(variable_len, 0);
+        file.read_exact(&mut buffer.variable)
             .map_err(|source| ArchiveReplayError::Io {
                 operation: "read frame payload",
                 path: segment_path.clone(),
@@ -458,19 +510,23 @@ impl ArchiveReplayer {
 
         let user_header_len = read_u32(&frame_header, FRAME_OFFSET_USER_HEADER_LEN) as usize;
         let payload_len = read_u32(&frame_header, FRAME_OFFSET_PAYLOAD_LEN) as usize;
-        if user_header_len + payload_len > variable_len {
+        let payload_start = user_header_len;
+        let payload_end = payload_start + payload_len;
+        if payload_end > variable_len {
             return Err(ArchiveReplayError::InvalidCommitEntry(
                 "frame user/payload lengths exceed frame bounds",
             ));
         }
 
-        if self.verify_checksums && (flags & FRAME_FLAG_CHECKSUM_CRC32C) != 0 {
+        let frame_checksum = if self.verify_checksums && (flags & FRAME_FLAG_CHECKSUM_CRC32C) != 0 {
             let expected = read_u32(&frame_header, FRAME_OFFSET_CHECKSUM);
-            let mut checksum_frame = vec![0u8; frame_len as usize];
-            checksum_frame[..FRAME_HEADER_LEN].copy_from_slice(&frame_header);
-            checksum_frame[FRAME_OFFSET_CHECKSUM..FRAME_OFFSET_CHECKSUM + 4].fill(0);
-            checksum_frame[FRAME_HEADER_LEN..].copy_from_slice(&variable);
-            let actual = crc32c::crc32c(&checksum_frame);
+            let mut actual = crc32c::crc32c_append(0, &frame_header[..FRAME_OFFSET_CHECKSUM]);
+            actual = crc32c::crc32c_append(actual, &[0u8; 4]);
+            actual = crc32c::crc32c_append(
+                actual,
+                &frame_header[FRAME_OFFSET_CHECKSUM + 4..FRAME_HEADER_LEN],
+            );
+            actual = crc32c::crc32c_append(actual, &buffer.variable);
             if expected != actual {
                 return Err(ArchiveReplayError::ChecksumMismatch {
                     expected,
@@ -478,18 +534,19 @@ impl ArchiveReplayer {
                     locator,
                 });
             }
-        }
+            actual
+        } else {
+            0
+        };
 
-        let user_header = variable[..user_header_len].to_vec();
-        let payload = variable[user_header_len..user_header_len + payload_len].to_vec();
-
-        Ok(ReplayedFrame {
+        Ok(ReplayedFrameView {
             commit_ordinal: read_u64(&frame_header, FRAME_OFFSET_COMMIT_ORDINAL),
             sequence: read_u64(&frame_header, FRAME_OFFSET_SEQUENCE),
             event_time_ns: read_u64(&frame_header, FRAME_OFFSET_EVENT_TIME_NS),
             commit_time_ns: read_u64(&frame_header, FRAME_OFFSET_COMMIT_TIME_NS),
-            user_header,
-            payload,
+            user_header: &buffer.variable[..user_header_len],
+            payload: &buffer.variable[payload_start..payload_end],
+            frame_checksum,
             locator,
         })
     }

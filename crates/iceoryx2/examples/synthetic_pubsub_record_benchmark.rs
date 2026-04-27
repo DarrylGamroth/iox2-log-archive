@@ -17,8 +17,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iceoryx2::prelude::*;
-use iox2_log_archive_core::log_archive::{AsyncIoBackend, PersistenceMode, RecorderProfile};
+use iox2_log_archive_core::log_archive::{
+    AsyncIoBackend, ChecksumMode, PersistenceMode, RecorderProfile,
+};
 use iox2_log_archive_iceoryx2::{PubSubRecorderConfig, record_publish_subscribe};
+
+const SYNTHETIC_SUBSCRIBER_MAX_BORROWED_SAMPLES: usize = 512;
 
 #[derive(Debug, Clone)]
 struct BenchmarkConfig {
@@ -29,6 +33,19 @@ struct BenchmarkConfig {
     segment_bytes: usize,
     backend: Option<AsyncIoBackend>,
     profile: RecorderProfile,
+    publish_mode: PublishMode,
+    timeout: Duration,
+    checksum_mode: Option<ChecksumMode>,
+    io_uring_queue_depth: Option<u32>,
+    io_submit_batch_max: Option<u32>,
+    io_cqe_batch_max: Option<u32>,
+    subscriber_max_borrowed_samples: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PublishMode {
+    Copy,
+    Loan,
 }
 
 fn main() -> Result<(), String> {
@@ -40,8 +57,9 @@ fn main() -> Result<(), String> {
         1024 => run::<1024>(config),
         4096 => run::<4096>(config),
         16384 => run::<16384>(config),
+        1048576 => run::<1048576>(config),
         other => Err(format!(
-            "unsupported --payload-bytes {other}; expected one of 8|64|256|1024|4096|16384"
+            "unsupported --payload-bytes {other}; expected one of 8|64|256|1024|4096|16384|1048576"
         )),
     }
 }
@@ -63,9 +81,16 @@ fn run<const PAYLOAD_BYTES: usize>(config: BenchmarkConfig) -> Result<(), String
     let pubsub = node
         .service_builder(&ServiceName::new(&service).map_err(to_string)?)
         .publish_subscribe::<[u8; PAYLOAD_BYTES]>()
+        .enable_safe_overflow(false)
+        .subscriber_max_buffer_size(config.subscriber_max_borrowed_samples)
+        .subscriber_max_borrowed_samples(config.subscriber_max_borrowed_samples)
         .open_or_create()
         .map_err(to_string)?;
-    let publisher = pubsub.publisher_builder().create().map_err(to_string)?;
+    let publisher = pubsub
+        .publisher_builder()
+        .unable_to_deliver_strategy(UnableToDeliverStrategy::Block)
+        .create()
+        .map_err(to_string)?;
 
     let recorder_config = PubSubRecorderConfig {
         service: service.clone(),
@@ -79,18 +104,19 @@ fn run<const PAYLOAD_BYTES: usize>(config: BenchmarkConfig) -> Result<(), String
         segment_preallocate: true,
         max_disk_bytes: None,
         async_io_backend: config.backend,
-        io_uring_queue_depth: None,
-        io_submit_batch_max: None,
-        io_cqe_batch_max: None,
+        io_uring_queue_depth: config.io_uring_queue_depth,
+        io_submit_batch_max: config.io_submit_batch_max,
+        io_cqe_batch_max: config.io_cqe_batch_max,
         io_uring_register_files: None,
-        checksum_mode: None,
+        checksum_mode: config.checksum_mode,
+        subscriber_max_borrowed_samples: Some(config.subscriber_max_borrowed_samples),
         out_of_space_policy: None,
         metadata_log_roll_bytes: None,
         metadata_log_max_bytes: None,
         source_service_id: Some(1),
         cycle_time: Duration::from_millis(1),
         max_messages: Some(config.records),
-        timeout: Some(Duration::from_secs(120)),
+        timeout: Some(config.timeout),
         flush_interval: Some(Duration::from_millis(100)),
         ack_level: None,
         shutdown_requested: None,
@@ -103,10 +129,24 @@ fn run<const PAYLOAD_BYTES: usize>(config: BenchmarkConfig) -> Result<(), String
     thread::sleep(Duration::from_millis(50));
 
     let mut sent = 0u64;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while !recorder.is_finished() && Instant::now() < deadline {
-        let payload = [payload_seed(sent + 1); PAYLOAD_BYTES];
-        publisher.send_copy(payload).map_err(to_string)?;
+    let deadline = Instant::now() + config.timeout;
+    while sent < config.records && !recorder.is_finished() && Instant::now() < deadline {
+        match config.publish_mode {
+            PublishMode::Copy => {
+                let payload = [payload_seed(sent + 1); PAYLOAD_BYTES];
+                publisher.send_copy(payload).map_err(to_string)?;
+            }
+            PublishMode::Loan => {
+                let mut sample = publisher.loan_uninit().map_err(to_string)?;
+                unsafe {
+                    sample
+                        .payload_mut()
+                        .as_mut_ptr()
+                        .write_bytes(payload_seed(sent + 1), 1);
+                    sample.assume_init().send().map_err(to_string)?;
+                }
+            }
+        }
         sent = sent.saturating_add(1);
         if sent % 4096 == 0 {
             thread::yield_now();
@@ -122,7 +162,7 @@ fn run<const PAYLOAD_BYTES: usize>(config: BenchmarkConfig) -> Result<(), String
     let wall_seconds = publish_elapsed.as_secs_f64().max(1e-9);
 
     println!(
-        "{{\"records\":{},\"payload_bytes\":{},\"sent_messages\":{},\"elapsed_seconds\":{:.6},\"wall_seconds\":{:.6},\"records_per_second\":{:.3},\"payload_bytes_per_second\":{:.3},\"wall_records_per_second\":{:.3},\"wall_payload_bytes_per_second\":{:.3},\"effective_backend\":\"{:?}\",\"configured_backend\":\"{:?}\",\"profile\":\"{:?}\",\"segment_bytes\":{},\"data_bytes_written\":{},\"metadata_bytes_written\":{},\"amplification_ratio\":{:.6},\"stop_reason\":\"{:?}\"}}",
+        "{{\"records\":{},\"payload_bytes\":{},\"sent_messages\":{},\"elapsed_seconds\":{:.6},\"wall_seconds\":{:.6},\"records_per_second\":{:.3},\"payload_bytes_per_second\":{:.3},\"wall_records_per_second\":{:.3},\"wall_payload_bytes_per_second\":{:.3},\"effective_backend\":\"{:?}\",\"configured_backend\":\"{:?}\",\"profile\":\"{:?}\",\"publish_mode\":\"{:?}\",\"checksum_mode\":\"{:?}\",\"io_uring_queue_depth\":{},\"io_submit_batch_max\":{},\"io_cqe_batch_max\":{},\"subscriber_max_borrowed_samples\":{},\"external_payload_fast_path\":{},\"segment_bytes\":{},\"data_bytes_written\":{},\"metadata_bytes_written\":{},\"amplification_ratio\":{:.6},\"stop_reason\":\"{:?}\"}}",
         summary.committed_records,
         summary.payload_bytes_committed,
         sent,
@@ -135,6 +175,13 @@ fn run<const PAYLOAD_BYTES: usize>(config: BenchmarkConfig) -> Result<(), String
         summary.effective_async_io_backend,
         summary.configured_async_io_backend,
         summary.profile,
+        config.publish_mode,
+        summary.checksum_mode,
+        summary.io_uring_queue_depth,
+        summary.io_submit_batch_max,
+        summary.io_cqe_batch_max,
+        summary.subscriber_max_borrowed_samples,
+        summary.external_payload_fast_path,
         config.segment_bytes,
         summary.data_bytes_written,
         summary.metadata_bytes_written,
@@ -154,6 +201,13 @@ fn parse_args() -> Result<BenchmarkConfig, String> {
     let mut segment_bytes = 64 * 1024 * 1024usize;
     let mut backend = None;
     let mut profile = RecorderProfile::Throughput;
+    let mut publish_mode = PublishMode::Copy;
+    let mut timeout = Duration::from_secs(120);
+    let mut checksum_mode = None;
+    let mut io_uring_queue_depth = None;
+    let mut io_submit_batch_max = None;
+    let mut io_cqe_batch_max = None;
+    let mut subscriber_max_borrowed_samples = SYNTHETIC_SUBSCRIBER_MAX_BORROWED_SAMPLES;
 
     let mut index = 1usize;
     while index < args.len() {
@@ -186,16 +240,52 @@ fn parse_args() -> Result<BenchmarkConfig, String> {
                 index += 1;
                 profile = parse_profile(args.get(index))?;
             }
+            "--publish-mode" => {
+                index += 1;
+                publish_mode = parse_publish_mode(args.get(index))?;
+            }
+            "--timeout-seconds" => {
+                index += 1;
+                timeout = Duration::from_secs(parse_u64(args.get(index), "--timeout-seconds")?);
+            }
+            "--checksum-mode" => {
+                index += 1;
+                checksum_mode = Some(parse_checksum_mode(args.get(index))?);
+            }
+            "--io-uring-queue-depth" => {
+                index += 1;
+                io_uring_queue_depth = Some(parse_u32(args.get(index), "--io-uring-queue-depth")?);
+            }
+            "--io-submit-batch-max" => {
+                index += 1;
+                io_submit_batch_max = Some(parse_u32(args.get(index), "--io-submit-batch-max")?);
+            }
+            "--io-cqe-batch-max" => {
+                index += 1;
+                io_cqe_batch_max = Some(parse_u32(args.get(index), "--io-cqe-batch-max")?);
+            }
+            "--subscriber-max-borrowed-samples" => {
+                index += 1;
+                subscriber_max_borrowed_samples =
+                    parse_usize(args.get(index), "--subscriber-max-borrowed-samples")?;
+            }
             "--help" | "-h" => {
                 return Err(String::from(
                     "usage: synthetic_pubsub_record_benchmark \
 --storage-path <path> \
 --metadata-log-path <path> \
 [--records <u64>] \
-[--payload-bytes 8|64|256|1024|4096|16384] \
+[--payload-bytes 8|64|256|1024|4096|16384|1048576] \
 [--segment-bytes <usize>] \
 [--backend auto|blocking|io_uring_required] \
-[--profile durable|balanced|throughput|replay]",
+[--profile durable|balanced|throughput|replay] \
+[--publish-mode copy|loan] \
+[--timeout-seconds <u64>] \
+[--checksum-mode crc32c|none] \
+[--io-uring-queue-depth <u32>] \
+[--io-submit-batch-max <u32>] \
+[--io-cqe-batch-max <u32>] \
+[--subscriber-max-borrowed-samples <usize>]",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -214,6 +304,14 @@ fn parse_args() -> Result<BenchmarkConfig, String> {
     if segment_bytes < 1024 {
         return Err(String::from("--segment-bytes must be >= 1024"));
     }
+    if timeout.is_zero() {
+        return Err(String::from("--timeout-seconds must be > 0"));
+    }
+    if subscriber_max_borrowed_samples == 0 {
+        return Err(String::from(
+            "--subscriber-max-borrowed-samples must be > 0",
+        ));
+    }
 
     Ok(BenchmarkConfig {
         storage_path,
@@ -223,6 +321,13 @@ fn parse_args() -> Result<BenchmarkConfig, String> {
         segment_bytes,
         backend,
         profile,
+        publish_mode,
+        timeout,
+        checksum_mode,
+        io_uring_queue_depth,
+        io_submit_batch_max,
+        io_cqe_batch_max,
+        subscriber_max_borrowed_samples,
     })
 }
 
@@ -237,6 +342,13 @@ fn parse_usize(value: Option<&String>, flag: &'static str) -> Result<usize, Stri
     value
         .ok_or_else(|| format!("missing value for {flag}"))?
         .parse::<usize>()
+        .map_err(|_| format!("invalid numeric value for {flag}"))
+}
+
+fn parse_u32(value: Option<&String>, flag: &'static str) -> Result<u32, String> {
+    value
+        .ok_or_else(|| format!("missing value for {flag}"))?
+        .parse::<u32>()
         .map_err(|_| format!("invalid numeric value for {flag}"))
 }
 
@@ -262,6 +374,28 @@ fn parse_profile(value: Option<&String>) -> Result<RecorderProfile, String> {
             "invalid --profile value: {other} (expected durable|balanced|throughput|replay)"
         )),
         None => Ok(RecorderProfile::Throughput),
+    }
+}
+
+fn parse_publish_mode(value: Option<&String>) -> Result<PublishMode, String> {
+    match value.map(String::as_str) {
+        Some("copy") => Ok(PublishMode::Copy),
+        Some("loan") => Ok(PublishMode::Loan),
+        Some(other) => Err(format!(
+            "invalid --publish-mode value: {other} (expected copy|loan)"
+        )),
+        None => Ok(PublishMode::Copy),
+    }
+}
+
+fn parse_checksum_mode(value: Option<&String>) -> Result<ChecksumMode, String> {
+    match value.map(String::as_str) {
+        Some("crc32c") => Ok(ChecksumMode::Crc32c),
+        Some("none") => Ok(ChecksumMode::None),
+        Some(other) => Err(format!(
+            "invalid --checksum-mode value: {other} (expected crc32c|none)"
+        )),
+        None => Ok(ChecksumMode::Crc32c),
     }
 }
 

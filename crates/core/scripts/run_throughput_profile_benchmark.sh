@@ -8,6 +8,7 @@ PAYLOAD_BYTES="${PAYLOAD_BYTES:-4096}"
 SEGMENT_BYTES="${SEGMENT_BYTES:-67108864}"
 BACKEND="${BACKEND:-auto}"
 PROFILE="${PROFILE:-throughput}"
+CLEANUP_ARCHIVE="${CLEANUP_ARCHIVE:-false}"
 
 STORAGE_PATH="${OUT_DIR}/storage"
 METADATA_PATH="${OUT_DIR}/metadata"
@@ -72,3 +73,8 @@ EOF
 
 echo "benchmark log: ${LOG_PATH}"
 echo "benchmark report: ${REPORT_PATH}"
+
+if [[ "${CLEANUP_ARCHIVE}" == "true" ]]; then
+  rm -rf "${STORAGE_PATH}" "${METADATA_PATH}"
+  echo "removed benchmark archive data: ${STORAGE_PATH} ${METADATA_PATH}"
+fi

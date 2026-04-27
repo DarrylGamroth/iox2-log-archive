@@ -92,7 +92,7 @@ appear in all capitals.
 - `iox2-log-query index catch-up --stream-id <id> --metadata-log-path <path> --db-path <path> [--max-records <n>] [--target current|latest]`
 - `iox2-log-query status --db-path <path> [--stream-id <id>]`
 - `iox2-log-query query locate-sequence --db-path <path> --stream-id <id> --at <u64>`
-- `iox2-log-query query locate-range --db-path <path> --stream-id <id> --from <u64> --count <usize>`
+- `iox2-log-query query locate-range --db-path <path> --stream-id <id> --from <u64> --count <usize> [--expand-selectors]`
 - `iox2-log-query query locate-locator --db-path <path> --stream-id <id> --at <segment:generation:offset:len>`
 - `iox2-log-query query locate-window --db-path <path> --stream-id <id> (--start-ns <u64> --end-ns <u64> | --start-utc <rfc3339> --end-utc <rfc3339>) [--time-field event|commit]`
 - `iox2-log-query query align-window --db-path <path> --streams <s1,s2,s3,s4> (--start-ns <u64> --end-ns <u64> | --start-utc <rfc3339> --end-utc <rfc3339>) [--time-field event|commit] [--mode anchor|grid] [--anchor-stream <id>] [--step-ns <u64>] [--max-skew-ns <u64>] [--fill-policy drop|null|nearest] [--require-all-streams]`
@@ -334,7 +334,7 @@ One aligned row per line:
 - `--emit summary`: no row output, only summary/statistics.
 - `--emit selectors` mapping:
 - `locate-sequence` emits one `sequence` selector.
-- `locate-range` emits one `range` selector by default; optional expansion to locator rows is allowed.
+- `locate-range` emits one `range` selector by default; `--expand-selectors` emits one locator selector per indexed row for export workflows that need exact query membership.
 - `locate-window` emits locator selectors.
 - `locate-locator` emits one locator selector.
 - `align-window` emits aligned selector rows keyed by stream id.

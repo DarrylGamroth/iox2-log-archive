@@ -35,6 +35,15 @@ use crate::cli::{
     LogRecordPublishSubscribeOptions,
 };
 
+#[derive(Debug, Clone, Copy)]
+struct CliProfileDefaults {
+    persistence_mode: CliPersistenceMode,
+    segment_bytes: usize,
+    spare_preallocated_segments: usize,
+    segment_preallocate: bool,
+    subscriber_max_borrowed_samples: Option<usize>,
+}
+
 #[derive(Debug)]
 pub(crate) enum LogRecordCommandError {
     InvalidInput(String),
@@ -145,6 +154,8 @@ struct RecordSummary<'a> {
     io_cqe_batch_max: u32,
     io_uring_register_files: bool,
     checksum_mode: &'static str,
+    subscriber_max_borrowed_samples: usize,
+    external_payload_fast_path: bool,
     out_of_space_policy: &'static str,
     metadata_log_roll_bytes: u64,
     metadata_log_max_bytes: u64,
@@ -184,9 +195,32 @@ fn record_publish_subscribe(
     format: Format,
 ) -> Result<(), LogRecordCommandError> {
     validate_runtime_options(&options.archive, &options.runtime.common)?;
+    if options.runtime.subscriber_max_borrowed_samples == Some(0) {
+        return Err(LogRecordCommandError::InvalidInput(
+            "--subscriber-max-borrowed-samples must be greater than 0".to_string(),
+        ));
+    }
     let paths = ArchivePaths::from_options(&options.archive)?;
     let requested_ack_level = options.runtime.common.ack_level.map(ack_level_from_cli);
     let shutdown_requested = install_shutdown_handler()?;
+    let defaults = cli_profile_defaults(options.archive.profile);
+    let persistence_mode = options.archive.mode.unwrap_or(defaults.persistence_mode);
+    let segment_bytes = options
+        .archive
+        .segment_bytes
+        .unwrap_or(defaults.segment_bytes);
+    let spare_preallocated_segments = options
+        .archive
+        .spare_preallocated_segments
+        .unwrap_or(defaults.spare_preallocated_segments);
+    let segment_preallocate = options
+        .archive
+        .segment_preallocate
+        .unwrap_or(defaults.segment_preallocate);
+    let subscriber_max_borrowed_samples = options
+        .runtime
+        .subscriber_max_borrowed_samples
+        .or(defaults.subscriber_max_borrowed_samples);
 
     let summary = record_iceoryx2_publish_subscribe(PubSubRecorderConfig {
         service: paths.service.clone(),
@@ -194,10 +228,10 @@ fn record_publish_subscribe(
         storage_path: paths.storage_path.clone(),
         metadata_log_path: paths.metadata_log_path.clone(),
         profile: recorder_profile(options.archive.profile),
-        persistence_mode: persistence_mode(options.archive.mode),
-        segment_bytes: options.archive.segment_bytes,
-        spare_preallocated_segments: options.archive.spare_preallocated_segments,
-        segment_preallocate: options.archive.segment_preallocate,
+        persistence_mode: persistence_mode_from_cli(persistence_mode),
+        segment_bytes,
+        spare_preallocated_segments,
+        segment_preallocate,
         max_disk_bytes: options.archive.max_disk_bytes,
         async_io_backend: options
             .archive
@@ -208,6 +242,7 @@ fn record_publish_subscribe(
         io_cqe_batch_max: options.archive.io_cqe_batch_max,
         io_uring_register_files: options.archive.io_uring_register_files,
         checksum_mode: options.archive.checksum_mode.map(checksum_mode_from_cli),
+        subscriber_max_borrowed_samples,
         out_of_space_policy: options
             .archive
             .out_of_space_policy
@@ -227,7 +262,7 @@ fn record_publish_subscribe(
     let summary = RecordSummary {
         operation: "record-publish-subscribe",
         path: path_payload(&paths),
-        profile: recorder_profile_label(summary.profile),
+        profile: cli_recorder_profile_label(options.archive.profile),
         persistence_mode: persistence_mode_label(summary.persistence_mode),
         configured_async_io_backend: async_backend_label(summary.configured_async_io_backend),
         effective_async_io_backend: effective_async_backend_label(
@@ -242,6 +277,8 @@ fn record_publish_subscribe(
         io_cqe_batch_max: summary.io_cqe_batch_max,
         io_uring_register_files: summary.io_uring_register_files,
         checksum_mode: checksum_mode_label(summary.checksum_mode),
+        subscriber_max_borrowed_samples: summary.subscriber_max_borrowed_samples,
+        external_payload_fast_path: summary.external_payload_fast_path,
         out_of_space_policy: out_of_space_policy_label(summary.out_of_space_policy),
         metadata_log_roll_bytes: summary.metadata_log_roll_bytes,
         metadata_log_max_bytes: summary.metadata_log_max_bytes,
@@ -285,6 +322,11 @@ fn validate_runtime_options(
     if runtime.cycle_time_ms == 0 {
         return Err(LogRecordCommandError::InvalidInput(
             "--cycle-time-ms must be greater than 0".to_string(),
+        ));
+    }
+    if archive.segment_bytes == Some(0) {
+        return Err(LogRecordCommandError::InvalidInput(
+            "--segment-bytes must be greater than 0".to_string(),
         ));
     }
     if archive.io_uring_queue_depth == Some(0) {
@@ -354,16 +396,49 @@ fn recorder_profile(value: CliRecorderProfile) -> RecorderProfile {
     }
 }
 
-fn recorder_profile_label(value: RecorderProfile) -> &'static str {
+fn cli_recorder_profile_label(value: CliRecorderProfile) -> &'static str {
     match value {
-        RecorderProfile::Durable => "Durable",
-        RecorderProfile::Balanced => "Balanced",
-        RecorderProfile::Throughput => "Throughput",
-        RecorderProfile::Replay => "Replay",
+        CliRecorderProfile::Durable => "Durable",
+        CliRecorderProfile::Balanced => "Balanced",
+        CliRecorderProfile::Throughput => "Throughput",
+        CliRecorderProfile::Replay => "Replay",
     }
 }
 
-fn persistence_mode(value: CliPersistenceMode) -> PersistenceMode {
+fn cli_profile_defaults(value: CliRecorderProfile) -> CliProfileDefaults {
+    match value {
+        CliRecorderProfile::Durable => CliProfileDefaults {
+            persistence_mode: CliPersistenceMode::Sync,
+            segment_bytes: 256 * 1024 * 1024,
+            spare_preallocated_segments: 1,
+            segment_preallocate: true,
+            subscriber_max_borrowed_samples: None,
+        },
+        CliRecorderProfile::Balanced => CliProfileDefaults {
+            persistence_mode: CliPersistenceMode::Async,
+            segment_bytes: 256 * 1024 * 1024,
+            spare_preallocated_segments: 1,
+            segment_preallocate: true,
+            subscriber_max_borrowed_samples: None,
+        },
+        CliRecorderProfile::Throughput => CliProfileDefaults {
+            persistence_mode: CliPersistenceMode::Async,
+            segment_bytes: 1024 * 1024 * 1024,
+            spare_preallocated_segments: 2,
+            segment_preallocate: true,
+            subscriber_max_borrowed_samples: None,
+        },
+        CliRecorderProfile::Replay => CliProfileDefaults {
+            persistence_mode: CliPersistenceMode::Async,
+            segment_bytes: 256 * 1024 * 1024,
+            spare_preallocated_segments: 1,
+            segment_preallocate: true,
+            subscriber_max_borrowed_samples: None,
+        },
+    }
+}
+
+fn persistence_mode_from_cli(value: CliPersistenceMode) -> PersistenceMode {
     match value {
         CliPersistenceMode::Volatile => PersistenceMode::Volatile,
         CliPersistenceMode::Async => PersistenceMode::Async,
@@ -469,4 +544,20 @@ fn print_output<T: Serialize>(payload: &T, format: Format) -> Result<(), LogReco
         .map_err(LogRecordCommandError::Internal)?;
     println!("{serialized}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn throughput_profile_does_not_assume_large_payload_borrow_capacity() {
+        let defaults = cli_profile_defaults(CliRecorderProfile::Throughput);
+
+        assert_eq!(defaults.persistence_mode, CliPersistenceMode::Async);
+        assert_eq!(defaults.segment_bytes, 1024 * 1024 * 1024);
+        assert_eq!(defaults.spare_preallocated_segments, 2);
+        assert!(defaults.segment_preallocate);
+        assert_eq!(defaults.subscriber_max_borrowed_samples, None);
+    }
 }

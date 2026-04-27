@@ -164,6 +164,12 @@ pub struct SelectorsSelector {
 #[derive(Clone, Debug, Subcommand)]
 pub enum ReplaySelector {
     #[clap(
+        about = "Replay every available archive record in sequence order.",
+        help_template = help_template(HelpOptions::DontPrintCommandSection)
+    )]
+    All,
+
+    #[clap(
         about = "Replay one record by archive sequence.",
         help_template = help_template(HelpOptions::DontPrintCommandSection)
     )]

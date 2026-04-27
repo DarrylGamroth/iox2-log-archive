@@ -406,19 +406,13 @@ fn replay(options: ReplayOptions, format: Format) -> Result<(), LogReplayCommand
 
     let mut emitter = ReplayEmitter::from_options(&options)?;
     let mut pacer = ReplayPacer::new(&options)?;
-    let selectors = selectors_from_options(&options)?;
-    if selectors.is_empty() {
-        return Err(LogReplayCommandError::InvalidInput(
-            "no selectors resolved for replay".to_string(),
-        ));
-    }
 
     let max_errors =
         options
             .max_errors
             .unwrap_or(if options.skip_missing { usize::MAX } else { 1 });
 
-    let replayer = ArchiveReplayerBuilder::new(&paths.storage_path)
+    let mut replayer = ArchiveReplayerBuilder::new(&paths.storage_path)
         .metadata_log_path(&paths.metadata_log_path)
         .open()
         .map_err(map_replay_error)?;
@@ -433,94 +427,68 @@ fn replay(options: ReplayOptions, format: Format) -> Result<(), LogReplayCommand
         bytes_emitted: 0,
     };
 
-    for selector in selectors {
-        match selector {
-            Selector::Sequence(sequence) => {
-                counters.selected = counters.selected.saturating_add(1);
-                let frame = replayer
-                    .read_at_sequence(sequence)
-                    .map_err(map_replay_error)?;
-
-                let Some(frame) = frame else {
-                    counters.handle_missing(
-                        1,
-                        options.skip_missing,
-                        max_errors,
-                        &format!("sequence {sequence} is not available"),
-                    )?;
-                    continue;
-                };
-
-                emit_one(&mut emitter, &mut pacer, &frame, &mut counters)?;
-            }
-            Selector::Locator(locator) => {
-                counters.selected = counters.selected.saturating_add(1);
-                let frame = match replayer.read_at_locator(locator) {
-                    Ok(value) => value,
-                    Err(ArchiveReplayError::MissingSegment(_)) => {
-                        counters.handle_missing(
-                            1,
-                            options.skip_missing,
-                            max_errors,
-                            &format!(
-                                "locator {}:{}:{}:{} is not available",
-                                locator.segment_id,
-                                locator.segment_generation,
-                                locator.file_offset,
-                                locator.frame_len
-                            ),
-                        )?;
-                        continue;
-                    }
-                    Err(error) => return Err(map_replay_error(error)),
-                };
-
-                emit_one(&mut emitter, &mut pacer, &frame, &mut counters)?;
-            }
-            Selector::Range { from, count } => {
-                counters.selected = counters.selected.saturating_add(count);
-                let mut remaining = count;
-                let mut next_sequence = from;
-                let mut emitted_for_range = 0usize;
-
-                while remaining > 0 {
-                    let batch = read_range_batch(&replayer, next_sequence, remaining)?;
-                    if batch.is_empty() {
-                        break;
-                    }
-
-                    for frame in &batch {
-                        emit_one(&mut emitter, &mut pacer, frame, &mut counters)?;
-                    }
-
-                    emitted_for_range = emitted_for_range.saturating_add(batch.len());
-                    remaining = remaining.saturating_sub(batch.len());
-                    let next = batch
-                        .last()
-                        .expect("batch is not empty")
-                        .sequence
-                        .checked_add(1)
-                        .ok_or_else(|| {
-                            LogReplayCommandError::InvalidInput(
-                                "sequence overflow while replaying range".to_string(),
-                            )
-                        })?;
-                    next_sequence = next;
-                }
-
-                let missing = count.saturating_sub(emitted_for_range);
-                if missing > 0 {
-                    counters.handle_missing(
-                        missing,
-                        options.skip_missing,
-                        max_errors,
-                        &format!(
-                            "range from {from} count {count} resolved only {emitted_for_range} records"
-                        ),
-                    )?;
-                }
-            }
+    match &options.selector {
+        ReplaySelector::All => {
+            replay_all(&mut replayer, &mut emitter, &mut pacer, &mut counters)?;
         }
+        ReplaySelector::Sequence(SequenceSelector { at }) => {
+            replay_selector(
+                Selector::Sequence(*at),
+                &replayer,
+                &mut emitter,
+                &mut pacer,
+                &mut counters,
+                options.skip_missing,
+                max_errors,
+            )?;
+        }
+        ReplaySelector::Range(RangeSelector { from, count }) => {
+            if *count == 0 {
+                return Err(LogReplayCommandError::InvalidInput(
+                    "--count must be > 0".to_string(),
+                ));
+            }
+            replay_selector(
+                Selector::Range {
+                    from: *from,
+                    count: *count,
+                },
+                &replayer,
+                &mut emitter,
+                &mut pacer,
+                &mut counters,
+                options.skip_missing,
+                max_errors,
+            )?;
+        }
+        ReplaySelector::Locator(LocatorSelector { at }) => {
+            replay_selector(
+                Selector::Locator(parse_locator(at)?),
+                &replayer,
+                &mut emitter,
+                &mut pacer,
+                &mut counters,
+                options.skip_missing,
+                max_errors,
+            )?;
+        }
+        ReplaySelector::Selectors(selector_options) => {
+            replay_selector_stream(
+                selector_options,
+                &replayer,
+                &mut emitter,
+                &mut pacer,
+                &mut counters,
+                options.skip_missing,
+                max_errors,
+            )?;
+        }
+    }
+
+    if counters.selected == 0 {
+        return Err(LogReplayCommandError::InvalidInput(
+            "no selectors resolved for replay".to_string(),
+        ));
     }
 
     let summary = ReplaySummary {
@@ -543,6 +511,128 @@ fn replay(options: ReplayOptions, format: Format) -> Result<(), LogReplayCommand
         print_output_to_stderr(&summary, format)
     } else {
         print_output_to_stdout(&summary, format)
+    }
+}
+
+fn replay_all(
+    replayer: &mut iox2_log_archive_core::log_archive::ArchiveReplayer,
+    emitter: &mut ReplayEmitter,
+    pacer: &mut ReplayPacer,
+    counters: &mut ReplayCounters,
+) -> Result<(), LogReplayCommandError> {
+    replayer.seek(0);
+    let batch_size = NonZeroUsize::new(1024).expect("constant batch size is non-zero");
+    loop {
+        let batch = replayer.next_batch(batch_size).map_err(map_replay_error)?;
+        if batch.is_empty() {
+            break;
+        }
+        counters.selected = counters.selected.saturating_add(batch.len());
+        for frame in &batch {
+            emit_one(emitter, pacer, frame, counters)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn replay_selector(
+    selector: Selector,
+    replayer: &iox2_log_archive_core::log_archive::ArchiveReplayer,
+    emitter: &mut ReplayEmitter,
+    pacer: &mut ReplayPacer,
+    counters: &mut ReplayCounters,
+    skip_missing: bool,
+    max_errors: usize,
+) -> Result<(), LogReplayCommandError> {
+    match selector {
+        Selector::Sequence(sequence) => {
+            counters.selected = counters.selected.saturating_add(1);
+            let frame = replayer
+                .read_at_sequence(sequence)
+                .map_err(map_replay_error)?;
+
+            let Some(frame) = frame else {
+                counters.handle_missing(
+                    1,
+                    skip_missing,
+                    max_errors,
+                    &format!("sequence {sequence} is not available"),
+                )?;
+                return Ok(());
+            };
+
+            emit_one(emitter, pacer, &frame, counters)
+        }
+        Selector::Locator(locator) => {
+            counters.selected = counters.selected.saturating_add(1);
+            let frame = match replayer.read_at_locator(locator) {
+                Ok(value) => value,
+                Err(ArchiveReplayError::MissingSegment(_)) => {
+                    counters.handle_missing(
+                        1,
+                        skip_missing,
+                        max_errors,
+                        &format!(
+                            "locator {}:{}:{}:{} is not available",
+                            locator.segment_id,
+                            locator.segment_generation,
+                            locator.file_offset,
+                            locator.frame_len
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                Err(error) => return Err(map_replay_error(error)),
+            };
+
+            emit_one(emitter, pacer, &frame, counters)
+        }
+        Selector::Range { from, count } => {
+            counters.selected = counters.selected.saturating_add(count);
+            let mut remaining = count;
+            let mut next_sequence = from;
+            let mut emitted_for_range = 0usize;
+
+            while remaining > 0 {
+                let batch = read_range_batch(replayer, next_sequence, remaining)?;
+                if batch.is_empty() {
+                    break;
+                }
+
+                for frame in &batch {
+                    emit_one(emitter, pacer, frame, counters)?;
+                }
+
+                emitted_for_range = emitted_for_range.saturating_add(batch.len());
+                remaining = remaining.saturating_sub(batch.len());
+                let next = batch
+                    .last()
+                    .expect("batch is not empty")
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        LogReplayCommandError::InvalidInput(
+                            "sequence overflow while replaying range".to_string(),
+                        )
+                    })?;
+                next_sequence = next;
+            }
+
+            let missing = count.saturating_sub(emitted_for_range);
+            if missing > 0 {
+                counters.handle_missing(
+                    missing,
+                    skip_missing,
+                    max_errors,
+                    &format!(
+                        "range from {from} count {count} resolved only {emitted_for_range} records"
+                    ),
+                )?;
+            }
+
+            Ok(())
+        }
     }
 }
 
@@ -577,50 +667,56 @@ fn read_range_batch(
         .map_err(map_replay_error)
 }
 
-fn selectors_from_options(options: &ReplayOptions) -> Result<Vec<Selector>, LogReplayCommandError> {
-    match &options.selector {
-        ReplaySelector::Sequence(SequenceSelector { at }) => Ok(vec![Selector::Sequence(*at)]),
-        ReplaySelector::Range(RangeSelector { from, count }) => {
-            if *count == 0 {
-                return Err(LogReplayCommandError::InvalidInput(
-                    "--count must be > 0".to_string(),
-                ));
-            }
-            Ok(vec![Selector::Range {
-                from: *from,
-                count: *count,
-            }])
-        }
-        ReplaySelector::Locator(LocatorSelector { at }) => {
-            Ok(vec![Selector::Locator(parse_locator(at)?)])
-        }
-        ReplaySelector::Selectors(selector) => selectors_from_stream(selector),
+fn replay_selector_stream(
+    options: &SelectorsSelector,
+    replayer: &iox2_log_archive_core::log_archive::ArchiveReplayer,
+    emitter: &mut ReplayEmitter,
+    pacer: &mut ReplayPacer,
+    counters: &mut ReplayCounters,
+    skip_missing: bool,
+    max_errors: usize,
+) -> Result<(), LogReplayCommandError> {
+    let reader = selector_reader(options)?;
+
+    match options.selector_format {
+        SelectorFormat::Ndjson => replay_ndjson_selectors(
+            reader,
+            replayer,
+            emitter,
+            pacer,
+            counters,
+            skip_missing,
+            max_errors,
+        ),
+        SelectorFormat::Csv => replay_csv_selectors(
+            reader,
+            replayer,
+            emitter,
+            pacer,
+            counters,
+            skip_missing,
+            max_errors,
+        ),
     }
 }
 
-fn selectors_from_stream(
-    options: &SelectorsSelector,
-) -> Result<Vec<Selector>, LogReplayCommandError> {
-    let reader: Box<dyn BufRead> = if options.stdin {
-        Box::new(BufReader::new(io::stdin()))
-    } else if let Some(path) = &options.file {
+fn selector_reader(options: &SelectorsSelector) -> Result<Box<dyn BufRead>, LogReplayCommandError> {
+    if options.stdin {
+        return Ok(Box::new(BufReader::new(io::stdin())));
+    }
+    if let Some(path) = &options.file {
         let file = File::open(path).map_err(|source| {
             LogReplayCommandError::Internal(anyhow!(
                 "failed to open selector file {}: {source}",
                 path.display()
             ))
         })?;
-        Box::new(BufReader::new(file))
-    } else {
-        return Err(LogReplayCommandError::InvalidInput(
-            "either --stdin or --file is required".to_string(),
-        ));
-    };
-
-    match options.selector_format {
-        SelectorFormat::Ndjson => parse_ndjson_selectors(reader),
-        SelectorFormat::Csv => parse_csv_selectors(reader),
+        return Ok(Box::new(BufReader::new(file)));
     }
+
+    Err(LogReplayCommandError::InvalidInput(
+        "either --stdin or --file is required".to_string(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -635,10 +731,15 @@ struct NdjsonSelectorRecord {
     frame_len: Option<u32>,
 }
 
-fn parse_ndjson_selectors(
+fn replay_ndjson_selectors(
     mut reader: Box<dyn BufRead>,
-) -> Result<Vec<Selector>, LogReplayCommandError> {
-    let mut selectors = Vec::new();
+    replayer: &iox2_log_archive_core::log_archive::ArchiveReplayer,
+    emitter: &mut ReplayEmitter,
+    pacer: &mut ReplayPacer,
+    counters: &mut ReplayCounters,
+    skip_missing: bool,
+    max_errors: usize,
+) -> Result<(), LogReplayCommandError> {
     let mut line = String::new();
     let mut line_number = 0usize;
 
@@ -662,10 +763,19 @@ fn parse_ndjson_selectors(
                 "invalid ndjson selector at line {line_number}: {error}"
             ))
         })?;
-        selectors.push(selector_from_ndjson_record(record, line_number)?);
+        let selector = selector_from_ndjson_record(record, line_number)?;
+        replay_selector(
+            selector,
+            replayer,
+            emitter,
+            pacer,
+            counters,
+            skip_missing,
+            max_errors,
+        )?;
     }
 
-    Ok(selectors)
+    Ok(())
 }
 
 fn selector_from_ndjson_record(
@@ -734,9 +844,15 @@ fn selector_from_ndjson_record(
     }
 }
 
-fn parse_csv_selectors(
+fn replay_csv_selectors(
     mut reader: Box<dyn BufRead>,
-) -> Result<Vec<Selector>, LogReplayCommandError> {
+    replayer: &iox2_log_archive_core::log_archive::ArchiveReplayer,
+    emitter: &mut ReplayEmitter,
+    pacer: &mut ReplayPacer,
+    counters: &mut ReplayCounters,
+    skip_missing: bool,
+    max_errors: usize,
+) -> Result<(), LogReplayCommandError> {
     let mut header_line = String::new();
     reader
         .read_line(&mut header_line)
@@ -774,7 +890,6 @@ fn parse_csv_selectors(
         }
     }
 
-    let mut selectors = Vec::new();
     let mut line = String::new();
     let mut line_number = 1usize;
 
@@ -849,10 +964,18 @@ fn parse_csv_selectors(
             }
         };
 
-        selectors.push(selector);
+        replay_selector(
+            selector,
+            replayer,
+            emitter,
+            pacer,
+            counters,
+            skip_missing,
+            max_errors,
+        )?;
     }
 
-    Ok(selectors)
+    Ok(())
 }
 
 fn parse_required_csv_u64(
@@ -1017,6 +1140,7 @@ fn map_rematerialize_error(error: ArchiveRematerializeError) -> LogReplayCommand
 
 fn selector_source_label(selector: &ReplaySelector) -> String {
     match selector {
+        ReplaySelector::All => "all".to_string(),
         ReplaySelector::Sequence(_) => "sequence".to_string(),
         ReplaySelector::Range(_) => "range".to_string(),
         ReplaySelector::Locator(_) => "locator".to_string(),

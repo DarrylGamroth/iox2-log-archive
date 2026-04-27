@@ -36,20 +36,40 @@ iox2-log-recorder --format JSON publish-subscribe \
   --service My/Camera/Frames \
   --storage-path /var/lib/iox2-log-archive/storage \
   --metadata-log-path /var/lib/iox2-log-archive/metadata \
-  --profile throughput \
-  --mode async \
-  --async-io-backend io-uring-required \
-  --io-uring-queue-depth 1024 \
-  --io-submit-batch-max 256 \
-  --io-cqe-batch-max 512 \
-  --io-uring-register-files true \
-  --metadata-log-roll-bytes 4294967296 \
-  --metadata-log-max-bytes 34359738368
+  --profile throughput
 ```
 
 Use `--async-io-backend blocking` for portability tests or platforms where
 `io_uring` is unavailable. Use `io-uring-required` only when failing fast is
 preferable to silently falling back.
+
+`--profile throughput` is the operator preset for high-rate large-payload
+streams: async persistence, `io_uring` throughput defaults, 1 GiB segments, two
+spare preallocated segments, and metadata roll sizing for large recordings.
+Borrowed-sample capacity for the external-payload fast path is intentionally an
+explicit workload tuning knob.
+
+For large camera-like payloads, the source service must support the requested
+borrowed-sample capacity. When it does, the recorder uses the external-payload
+fast path and retains samples only until the asynchronous write completes. When
+the service does not support enough borrowed samples, recording still works but
+uses the compatible copied path.
+
+Size borrowed samples carefully for large payload services. iceoryx2 publisher
+data-segment capacity scales approximately with:
+
+```text
+max_subscribers * (subscriber_max_buffer_size + subscriber_max_borrowed_samples)
+  + history_size
+  + publisher_max_loaned_samples
+```
+
+So a large borrowed-sample value is effectively multiplied by the configured
+subscriber capacity. For 1 MiB frames, 512 borrowed samples can mean hundreds of
+MiB per publisher with one subscriber and multiple GiB per publisher with many
+configured subscribers. A 100 FPS camera with 50 ms storage tail latency may
+only need single-digit borrowed samples plus margin; a 1000 FPS application
+should tune this explicitly.
 
 ## Query And Replay
 
@@ -70,12 +90,41 @@ iox2-log-query --format JSON query locate-range \
   --stream-id My/Camera/Frames \
   --from 1 \
   --count 100 |
-iox2-log-replay --format JSON selectors \
+iox2-log-replay --format JSON replay \
   --storage-path /var/lib/iox2-log-archive/storage \
   --metadata-log-path /var/lib/iox2-log-archive/metadata \
-  --stdin \
   --to publish-subscribe \
-  --service My/Camera/Frames/Replay
+  --service My/Camera/Frames/Replay \
+  selectors --stdin --selector-format ndjson
+```
+
+Replay every available record in sequence order:
+
+```bash
+iox2-log-replay --format JSON replay \
+  --storage-path /var/lib/iox2-log-archive/storage \
+  --metadata-log-path /var/lib/iox2-log-archive/metadata \
+  --to publish-subscribe \
+  --service My/Camera/Frames/Replay \
+  all
+```
+
+Future export-style tools should use the same selector stream boundary. For
+exports that need exact query membership, expand sequence ranges into locator
+selectors:
+
+```bash
+iox2-log-query --format JSON query locate-range \
+  --db-path /var/lib/iox2-log-archive/query.sqlite \
+  --stream-id My/Camera/Frames \
+  --from 1 \
+  --count 100 \
+  --expand-selectors |
+iox2-log-export-fits \
+  --storage-path /var/lib/iox2-log-archive/storage \
+  --metadata-log-path /var/lib/iox2-log-archive/metadata \
+  --output-dir /data/fits \
+  --selectors-stdin
 ```
 
 ## Orchestrator
@@ -85,3 +134,7 @@ by `iox2-log-orchestrator` from the sibling `iox2-log-archive-orchestrator`
 repository. Configure `IOX2_LOG_ORCH_RECORDER_BIN` and
 `IOX2_LOG_ORCH_CONTROL_BIN` to point at the installed binaries from this
 repository.
+
+See `orchestrator-integration.md` for the full boundary between the
+orchestrator control plane and this repository's recorder, control, query,
+replay, and admin tools.

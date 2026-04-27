@@ -26,8 +26,9 @@ use iceoryx2::service::static_config::message_type_details::TypeDetail;
 use iox2_log_archive_core::log_archive::{
     ArchiveRecorder, ArchiveRecorderBuilder, ArchiveRecorderError, AsyncIoBackend, ChecksumMode,
     DEFAULT_WAIT_DURABLE_DATA_AND_COMMIT_LOG_TIMEOUT, DEFAULT_WAIT_DURABLE_DATA_TIMEOUT,
-    EffectiveAsyncIoBackend, OutOfSpacePolicy, PersistenceMode, PublishSubscribeRecordInput,
-    RecorderAckLevel, RecorderProfile,
+    EffectiveAsyncIoBackend, OutOfSpacePolicy, PersistenceMode,
+    PublishSubscribeExternalPayloadInput, PublishSubscribeRecordInput, RecorderAckLevel,
+    RecorderProfile,
 };
 
 use crate::{
@@ -75,6 +76,8 @@ pub struct PubSubRecorderConfig {
     pub io_uring_register_files: Option<bool>,
     /// Optional frame checksum mode override.
     pub checksum_mode: Option<ChecksumMode>,
+    /// Optional minimum subscriber borrowed-sample capacity requested when opening the service.
+    pub subscriber_max_borrowed_samples: Option<usize>,
     /// Optional out-of-space policy override.
     pub out_of_space_policy: Option<OutOfSpacePolicy>,
     /// Optional active metadata-log roll threshold override.
@@ -141,6 +144,10 @@ pub struct PubSubRecorderSummary {
     pub io_uring_register_files: bool,
     /// Configured frame checksum mode.
     pub checksum_mode: ChecksumMode,
+    /// Borrowed-sample capacity of the opened pub-sub service.
+    pub subscriber_max_borrowed_samples: usize,
+    /// Whether the external-payload fast path was enabled for this run.
+    pub external_payload_fast_path: bool,
     /// Configured out-of-space policy.
     pub out_of_space_policy: OutOfSpacePolicy,
     /// Configured metadata-log roll threshold.
@@ -240,16 +247,23 @@ pub fn record_publish_subscribe(
 
     let service_name = ServiceName::new(&config.service).map_err(to_iox2_error)?;
     let service_types = get_pubsub_service_types(&service_name, &node)?;
-
+    let mut service_builder = node
+        .service_builder(&service_name)
+        .publish_subscribe::<[CustomPayloadMarker]>()
+        .user_header::<CustomHeaderMarker>();
+    if let Some(subscriber_max_borrowed_samples) = config.subscriber_max_borrowed_samples {
+        service_builder =
+            service_builder.subscriber_max_borrowed_samples(subscriber_max_borrowed_samples);
+    }
     let service = unsafe {
-        node.service_builder(&service_name)
-            .publish_subscribe::<[CustomPayloadMarker]>()
-            .user_header::<CustomHeaderMarker>()
+        service_builder
             .__internal_set_payload_type_details(&service_types.payload)
             .__internal_set_user_header_type_details(&service_types.user_header)
             .open_or_create()
     }
     .map_err(to_iox2_error)?;
+    let use_external_payload_fast_path = service.static_config().subscriber_max_borrowed_samples()
+        >= default_external_payload_borrow_capacity(&config);
 
     let subscriber = service
         .subscriber_builder()
@@ -388,23 +402,48 @@ pub fn record_publish_subscribe(
             if is_paused {
                 dropped_while_paused = dropped_while_paused.saturating_add(1);
             } else {
-                let input = PublishSubscribeRecordInput {
-                    event_time_ns: unix_time_now_ns(),
-                    source_service_id,
-                    source_publisher_id: fold_u128_to_u64(sample.origin().value()),
-                    source_sequence: None,
-                    user_header,
-                    payload,
-                };
+                let event_time_ns = unix_time_now_ns();
+                let source_publisher_id = fold_u128_to_u64(sample.origin().value());
 
-                if let Some(level) = config.ack_level {
-                    recorder.append_publish_subscribe_record_with_ack(
-                        input,
-                        level,
-                        ack_timeout(level),
-                    )?;
+                if use_external_payload_fast_path {
+                    let user_header = user_header.to_vec();
+                    let payload_ptr = payload.as_ptr();
+                    let payload_len = payload.len();
+                    let input = PublishSubscribeExternalPayloadInput {
+                        event_time_ns,
+                        source_service_id,
+                        source_publisher_id,
+                        source_sequence: None,
+                        user_header: &user_header,
+                        payload_ptr,
+                        payload_len,
+                        payload_owner: Box::new(sample),
+                    };
+                    let commit = unsafe {
+                        recorder.append_publish_subscribe_external_payload_record(input)
+                    }?;
+                    if let Some(level) = config.ack_level {
+                        recorder.wait_for_ack(commit, level, ack_timeout(level))?;
+                    }
                 } else {
-                    recorder.append_publish_subscribe_record(input)?;
+                    let input = PublishSubscribeRecordInput {
+                        event_time_ns,
+                        source_service_id,
+                        source_publisher_id,
+                        source_sequence: None,
+                        user_header,
+                        payload,
+                    };
+
+                    if let Some(level) = config.ack_level {
+                        recorder.append_publish_subscribe_record_with_ack(
+                            input,
+                            level,
+                            ack_timeout(level),
+                        )?;
+                    } else {
+                        recorder.append_publish_subscribe_record(input)?;
+                    }
                 }
 
                 messages_recorded = messages_recorded.saturating_add(1);
@@ -488,6 +527,8 @@ pub fn record_publish_subscribe(
         io_cqe_batch_max: recorder.io_cqe_batch_max(),
         io_uring_register_files: recorder.io_uring_register_files(),
         checksum_mode: recorder.checksum_mode(),
+        subscriber_max_borrowed_samples: service.static_config().subscriber_max_borrowed_samples(),
+        external_payload_fast_path: use_external_payload_fast_path,
         out_of_space_policy: recorder.out_of_space_policy(),
         metadata_log_roll_bytes: recorder.metadata_log_roll_bytes(),
         metadata_log_max_bytes: recorder.metadata_log_max_bytes(),
@@ -555,6 +596,25 @@ fn recorder_builder(config: &PubSubRecorderConfig) -> ArchiveRecorderBuilder {
     }
 
     builder
+}
+
+fn default_external_payload_borrow_capacity(config: &PubSubRecorderConfig) -> usize {
+    if let Some(subscriber_max_borrowed_samples) = config.subscriber_max_borrowed_samples {
+        return subscriber_max_borrowed_samples;
+    }
+
+    config
+        .io_uring_queue_depth
+        .unwrap_or(default_profile_io_uring_queue_depth(config.profile))
+        .saturating_mul(2)
+        .max(2) as usize
+}
+
+fn default_profile_io_uring_queue_depth(profile: RecorderProfile) -> u32 {
+    match profile {
+        RecorderProfile::Durable | RecorderProfile::Balanced | RecorderProfile::Replay => 256,
+        RecorderProfile::Throughput => 256,
+    }
 }
 
 fn validate_config(config: &PubSubRecorderConfig) -> Result<(), PubSubRecorderError> {
@@ -709,4 +769,57 @@ fn control_response_for_recorder(
 
 fn to_iox2_error(error: impl core::fmt::Debug) -> PubSubRecorderError {
     PubSubRecorderError::Iceoryx2(format!("{error:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> PubSubRecorderConfig {
+        PubSubRecorderConfig {
+            service: "Test/Service".to_string(),
+            node_name: "test-recorder".to_string(),
+            storage_path: PathBuf::from("/tmp/iox2-log-archive-test-storage"),
+            metadata_log_path: PathBuf::from("/tmp/iox2-log-archive-test-metadata"),
+            profile: RecorderProfile::Throughput,
+            persistence_mode: PersistenceMode::Async,
+            segment_bytes: 1024 * 1024 * 1024,
+            spare_preallocated_segments: 2,
+            segment_preallocate: true,
+            max_disk_bytes: None,
+            async_io_backend: None,
+            io_uring_queue_depth: None,
+            io_submit_batch_max: None,
+            io_cqe_batch_max: None,
+            io_uring_register_files: None,
+            checksum_mode: None,
+            subscriber_max_borrowed_samples: None,
+            out_of_space_policy: None,
+            metadata_log_roll_bytes: None,
+            metadata_log_max_bytes: None,
+            source_service_id: None,
+            cycle_time: Duration::from_millis(10),
+            max_messages: None,
+            timeout: None,
+            flush_interval: Some(Duration::from_millis(100)),
+            ack_level: None,
+            shutdown_requested: None,
+        }
+    }
+
+    #[test]
+    fn explicit_borrow_capacity_controls_external_payload_fast_path_requirement() {
+        let mut config = test_config();
+        config.subscriber_max_borrowed_samples = Some(8);
+
+        assert_eq!(default_external_payload_borrow_capacity(&config), 8);
+    }
+
+    #[test]
+    fn implicit_borrow_capacity_follows_io_depth_for_small_message_throughput() {
+        let mut config = test_config();
+        config.io_uring_queue_depth = Some(16);
+
+        assert_eq!(default_external_payload_borrow_capacity(&config), 32);
+    }
 }

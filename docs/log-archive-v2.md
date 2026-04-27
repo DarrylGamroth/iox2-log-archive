@@ -594,7 +594,7 @@ Queue knob definitions (normative):
 - `iox2-log-admin inspect-record --service <name> --storage-path <path> [--metadata-log-path <path>] --at-sequence <seq>`
 - `iox2-log-admin inspect-record --service <name> --storage-path <path> [--metadata-log-path <path>] --at-locator <segment_id>:<generation>:<offset>:<len>`
 - Implemented long-running command set (`iox2-log-recorder ...`):
-- `iox2-log-recorder publish-subscribe --service <name> --storage-path <path> [--metadata-log-path <path>] [--profile durable|balanced|throughput|replay] [--mode volatile|async|sync] [--segment-bytes <bytes>] [--spare-preallocated-segments <n>] [--segment-preallocate true|false] [--max-disk-bytes <bytes>] [--node-name <name>] [--cycle-time-ms <ms>] [--flush-interval-ms <ms>] [--max-messages <n>] [--timeout-ms <ms>] [--ack-level accepted|durable-data|durable-data-and-commit-log]`
+- `iox2-log-recorder publish-subscribe --service <name> --storage-path <path> [--metadata-log-path <path>] [--profile durable|balanced|throughput|replay] [--mode volatile|async|sync] [--segment-bytes <bytes>] [--spare-preallocated-segments <n>] [--segment-preallocate true|false] [--max-disk-bytes <bytes>] [--node-name <name>] [--cycle-time-ms <ms>] [--flush-interval-ms <ms>] [--max-messages <n>] [--timeout-ms <ms>] [--ack-level accepted|durable-data|durable-data-and-commit-log] [--subscriber-max-borrowed-samples <n>]`
 - `iox2-log-recorder log ...` is retired on `design/log-archive-pubsub-v1`; compatibility surfaces must be absent or return deterministic unsupported errors.
 - `status` output `MUST` include:
 - operation name and archive path identity (`service`, `storage_path`, `metadata_log_path`)

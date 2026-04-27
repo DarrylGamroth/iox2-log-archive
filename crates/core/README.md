@@ -50,6 +50,8 @@ Data flow:
 - `iox2-log-recorder` captures samples and appends archive frames.
 - `iox2-log-query` indexes `commit.idxlog` into SQLite and emits replay selectors.
 - `iox2-log-replay` consumes selectors and rematerializes to `publish_subscribe` or `stdout`.
+- Export tools should consume the same selector stream; use expanded locator selectors
+  when exact query membership matters.
 
 Example variables:
 
@@ -117,6 +119,19 @@ cargo run -p iox2-log-archive-cli --bin iox2-log-query -- \
     selectors --stdin --selector-format ndjson
 ```
 
+Replay every available record in sequence order:
+
+```bash
+cargo run -p iox2-log-archive-cli --bin iox2-log-replay -- \
+  --format JSON \
+  replay \
+  --storage-path "$STORAGE_PATH" \
+  --metadata-log-path "$METADATA_PATH" \
+  --to publish-subscribe \
+  --service "$SERVICE" \
+  all
+```
+
 Terminal B, or replay same selectors to `stdout` for inspection:
 
 ```bash
@@ -135,6 +150,27 @@ cargo run -p iox2-log-archive-cli --bin iox2-log-query -- \
     --metadata-log-path "$METADATA_PATH" \
     --to stdout \
     selectors --stdin --selector-format ndjson
+```
+
+For export/data-product tools, keep query and archive reads decoupled with the
+same pipe boundary. Range queries can emit exact locator selectors; a future
+FITS exporter can consume that stream directly:
+
+```bash
+cargo run -p iox2-log-archive-cli --bin iox2-log-query -- \
+  --format JSON \
+  query locate-range \
+  --db-path "$DB_PATH" \
+  --stream-id "$STREAM_ID" \
+  --from 1 \
+  --count 100 \
+  --emit selectors \
+  --expand-selectors \
+| iox2-log-export-fits \
+    --storage-path "$STORAGE_PATH" \
+    --metadata-log-path "$METADATA_PATH" \
+    --output-dir /data/fits \
+    --selectors-stdin
 ```
 
 ## Quickstart Example

@@ -169,6 +169,13 @@ pub struct LocateRangeOptions {
 
     #[clap(long, default_value_t = QueryEmitMode::Selectors, value_enum)]
     pub emit: QueryEmitMode,
+
+    #[clap(
+        long,
+        default_value_t = false,
+        help = "With --emit selectors, emit one locator selector per indexed row instead of one compact range selector."
+    )]
+    pub expand_selectors: bool,
 }
 
 #[derive(Clone, Debug, Args)]

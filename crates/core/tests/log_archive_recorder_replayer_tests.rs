@@ -24,7 +24,7 @@ use iox2_log_archive_core::log_archive::{
     ArchiveSourcePattern, AsyncIoBackend, ChecksumMode, DEFAULT_ACK_POLL_INTERVAL,
     DEFAULT_WAIT_DURABLE_DATA_AND_COMMIT_LOG_TIMEOUT, DEFAULT_WAIT_DURABLE_DATA_TIMEOUT,
     EffectiveAsyncIoBackend, PersistenceMode, PublishSubscribeRecordInput, RecorderAckLevel,
-    ReplayBudget, decode_adapter_user_header,
+    ReplayBudget, ReplayFrameBuffer, decode_adapter_user_header,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -185,6 +185,16 @@ fn log_archive_recorder_and_replayer_support_sequence_and_locator_reads() {
         assert_that!(by_locator.sequence, eq sequence);
         assert_that!(
             by_locator.payload,
+            eq expected_payloads[(sequence - 1) as usize].clone()
+        );
+
+        let mut buffer = ReplayFrameBuffer::new();
+        let view = replayer
+            .read_at_locator_into(locators[(sequence - 1) as usize], &mut buffer)
+            .unwrap();
+        assert_that!(view.sequence, eq sequence);
+        assert_that!(
+            view.payload.to_vec(),
             eq expected_payloads[(sequence - 1) as usize].clone()
         );
     }

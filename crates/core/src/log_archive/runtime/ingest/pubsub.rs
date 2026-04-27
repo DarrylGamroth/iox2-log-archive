@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use super::super::common::{
     ArchiveRecorder, ArchiveRecorderError, ArchiveSourceMetadata, ArchiveSourcePattern,
-    PublishSubscribeRecordInput, RecordedCommit, RecorderAckLevel,
+    PublishSubscribeExternalPayloadInput, PublishSubscribeRecordInput, RecordedCommit,
+    RecorderAckLevel,
 };
 
 impl ArchiveRecorder {
@@ -38,6 +39,34 @@ impl ArchiveRecorder {
             input.user_header,
             input.payload,
         )
+    }
+
+    /// Appends one publish-subscribe record whose payload is kept alive by an owner guard.
+    ///
+    /// # Safety
+    ///
+    /// `input.payload_ptr` must point to `input.payload_len` initialized bytes and
+    /// must remain valid until `input.payload_owner` is dropped by the recorder.
+    pub unsafe fn append_publish_subscribe_external_payload_record(
+        &mut self,
+        input: PublishSubscribeExternalPayloadInput<'_>,
+    ) -> Result<RecordedCommit, ArchiveRecorderError> {
+        let source_metadata = ArchiveSourceMetadata {
+            source_pattern: ArchiveSourcePattern::PublishSubscribe,
+            source_service_id: input.source_service_id,
+            source_instance_id: input.source_publisher_id,
+            source_sequence: input.source_sequence,
+        };
+        unsafe {
+            self.append_adapted_external_payload_record(
+                source_metadata,
+                input.event_time_ns,
+                input.user_header,
+                input.payload_ptr,
+                input.payload_len,
+                input.payload_owner,
+            )
+        }
     }
 
     /// Appends one publish-subscribe record and waits for requested acknowledgment level.
