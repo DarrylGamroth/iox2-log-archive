@@ -309,3 +309,64 @@ fn sqlite_schema_versions_include_migration_and_stream_state_versions() {
         vec![SQLITE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION + 1]
     );
 }
+
+#[test]
+fn sqlite_schema_version_errors_cover_missing_old_and_future_schema_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let missing_migration_db = temp.path().join("missing-migration.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&missing_migration_db).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE indexer_state (
+                    stream_id TEXT PRIMARY KEY,
+                    log_id BLOB NOT NULL,
+                    last_commit_ordinal INTEGER NOT NULL,
+                    last_indexed_commit_ordinal INTEGER NOT NULL,
+                    roll_file TEXT NOT NULL,
+                    byte_offset INTEGER NOT NULL,
+                    updated_at_ns INTEGER NOT NULL,
+                    schema_version INTEGER NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+    }
+    let missing_error =
+        SqliteMetadataSink::list_schema_versions(&missing_migration_db).unwrap_err();
+    assert!(
+        missing_error
+            .details
+            .contains("schema_migrations table is missing")
+    );
+
+    let malformed_migration_db = temp.path().join("malformed-migration.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&malformed_migration_db).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE schema_migrations (
+                    schema_version INTEGER PRIMARY KEY,
+                    applied_at_ns INTEGER NOT NULL,
+                    tool_version TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(schema_version, applied_at_ns, tool_version)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![i64::MAX, 0i64, "test"],
+            )
+            .unwrap();
+    }
+    let malformed_error =
+        SqliteMetadataSink::list_schema_versions(&malformed_migration_db).unwrap_err();
+    assert!(
+        malformed_error
+            .details
+            .contains("schema_migrations.schema_version")
+    );
+}

@@ -15,8 +15,10 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use iox2_log_archive_core::log_archive::{
-    ArchiveRecorderBuilder, ChecksumMode, PersistenceMode, PublishSubscribeRecordInput,
+    ArchiveLocator, ArchiveMetadataSink, ArchiveRecorderBuilder, ArchiveSourcePattern,
+    ChecksumMode, MetadataCommitRecord, PersistenceMode, PublishSubscribeRecordInput,
 };
+use iox2_log_archive_sqlite::{SQLITE_SCHEMA_VERSION, SqliteIndexerState, SqliteMetadataSink};
 
 fn assert_success(output: &Output, context: &str) {
     assert!(
@@ -540,6 +542,125 @@ fn admin_commands_cover_archive_lifecycle_and_inspection() -> Result<(), Box<dyn
 }
 
 #[test]
+fn admin_commands_cover_start_stop_delete_detached_and_record_errors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let admin_bin = env!("CARGO_BIN_EXE_iox2-log-admin");
+
+    let empty_storage = temp.path().join("empty-archive");
+    let empty_metadata = temp.path().join("empty-metadata");
+    let empty_archive = archive_args("Test/Admin/StartStop", &empty_storage, &empty_metadata);
+
+    let mut start_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "start".to_string(),
+    ];
+    start_args.extend(empty_archive.clone());
+    start_args.extend(["--segment-bytes".to_string(), "4096".to_string()]);
+    start_args.extend(["--segment-preallocate".to_string(), "false".to_string()]);
+    start_args.extend(["--spare-preallocated-segments".to_string(), "0".to_string()]);
+    let output = Command::new(admin_bin).args(start_args).output()?;
+    assert_success(&output, "admin start");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"operation\": \"start\""));
+    assert!(empty_storage.join("catalog.bin").exists());
+    assert!(empty_metadata.join("commit.idxlog").exists());
+
+    let mut stop_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "stop".to_string(),
+    ];
+    stop_args.extend(empty_archive);
+    let output = Command::new(admin_bin).args(stop_args).output()?;
+    assert_success(&output, "admin stop");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"operation\": \"stop\""));
+
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    create_archive(&storage_path, &metadata_path)?;
+    let archive = archive_args("Test/Admin/DeleteDetached", &storage_path, &metadata_path);
+
+    let mut invalid_locator_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "inspect-record".to_string(),
+    ];
+    invalid_locator_args.extend(archive.clone());
+    invalid_locator_args.extend(["--at-locator".to_string(), "1:0:0:64".to_string()]);
+    let output = Command::new(admin_bin)
+        .args(invalid_locator_args)
+        .output()?;
+    assert_failure_contains(
+        &output,
+        "invalid locator segment generation '0'",
+        "admin invalid locator",
+    );
+
+    let mut missing_sequence_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "inspect-record".to_string(),
+    ];
+    missing_sequence_args.extend(archive.clone());
+    missing_sequence_args.extend(["--at-sequence".to_string(), "99".to_string()]);
+    let output = Command::new(admin_bin)
+        .args(missing_sequence_args)
+        .output()?;
+    assert_failure_contains(
+        &output,
+        "sequence 99 is not available",
+        "admin missing record",
+    );
+
+    let mut detach_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "detach".to_string(),
+    ];
+    detach_args.extend(archive.clone());
+    detach_args.extend(["--before-sequence".to_string(), "5".to_string()]);
+    assert_success(
+        &Command::new(admin_bin).args(detach_args).output()?,
+        "detach",
+    );
+
+    let mut delete_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "delete-detached".to_string(),
+    ];
+    delete_args.extend(archive.clone());
+    delete_args.extend(["--before-sequence".to_string(), "5".to_string()]);
+    let output = Command::new(admin_bin).args(delete_args).output()?;
+    assert_success(&output, "delete detached");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"affected_segments\": 1"));
+
+    let storage_without_metadata = temp.path().join("archive-without-metadata");
+    let metadata_missing = temp.path().join("metadata-missing");
+    create_archive(&storage_without_metadata, &metadata_missing)?;
+    std::fs::remove_file(metadata_missing.join("commit.idxlog"))?;
+    let mut missing_commit_args = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "status".to_string(),
+    ];
+    missing_commit_args.extend(archive_args(
+        "Test/Admin/MissingCommitLog",
+        &storage_without_metadata,
+        &metadata_missing,
+    ));
+    let output = Command::new(admin_bin).args(missing_commit_args).output()?;
+    assert_failure_contains(
+        &output,
+        "commit.idxlog not found",
+        "admin missing commit log",
+    );
+
+    Ok(())
+}
+
+#[test]
 fn admin_and_control_report_validation_errors() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let missing_storage = temp.path().join("missing-archive");
@@ -766,6 +887,202 @@ fn query_commands_cover_status_locators_windows_and_alignment()
         .output()?;
     assert_success(&empty_window, "empty locate-window summary");
     assert!(String::from_utf8_lossy(&empty_window.stdout).contains("\"rows\": 0"));
+
+    Ok(())
+}
+
+#[test]
+fn query_commands_cover_reindex_latest_filtered_status_and_not_indexed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    let db_path = temp.path().join("query.sqlite");
+    create_archive(&storage_path, &metadata_path)?;
+
+    let query_bin = env!("CARGO_BIN_EXE_iox2-log-query");
+    let db = db_path.to_str().expect("utf-8 db path");
+    let metadata = metadata_path.to_str().expect("utf-8 metadata path");
+
+    let initial = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "index",
+            "catch-up",
+            "--stream-id",
+            "cam-a",
+            "--metadata-log-path",
+            metadata,
+            "--db-path",
+            db,
+            "--target",
+            "latest",
+        ])
+        .output()?;
+    assert_success(&initial, "query catch-up latest");
+    assert!(String::from_utf8_lossy(&initial.stdout).contains("\"target\": \"latest\""));
+
+    let reindex = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "index",
+            "catch-up",
+            "--stream-id",
+            "cam-a",
+            "--metadata-log-path",
+            metadata,
+            "--db-path",
+            db,
+            "--reindex",
+        ])
+        .output()?;
+    assert_success(&reindex, "query catch-up reindex");
+    assert!(String::from_utf8_lossy(&reindex.stdout).contains("\"operation\": \"index-catch-up\""));
+    assert!(
+        String::from_utf8_lossy(&reindex.stdout).contains("\"last_indexed_commit_ordinal\": 4")
+    );
+
+    let status_a = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "status",
+            "--db-path",
+            db,
+            "--stream-id",
+            "cam-a",
+        ])
+        .output()?;
+    assert_success(&status_a, "filtered status existing stream");
+    assert!(String::from_utf8_lossy(&status_a.stdout).contains("\"stream_count\": 1"));
+    assert!(String::from_utf8_lossy(&status_a.stdout).contains("\"stream_id\": \"cam-a\""));
+
+    let status_missing = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "status",
+            "--db-path",
+            db,
+            "--stream-id",
+            "cam-b",
+        ])
+        .output()?;
+    assert_success(&status_missing, "filtered status missing stream");
+    assert!(String::from_utf8_lossy(&status_missing.stdout).contains("\"stream_count\": 0"));
+
+    let unavailable = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-sequence",
+            "--db-path",
+            db,
+            "--stream-id",
+            "cam-a",
+            "--at",
+            "99",
+        ])
+        .output()?;
+    assert_failure_contains(
+        &unavailable,
+        "sequence 99 is not available",
+        "query missing indexed sequence",
+    );
+
+    let partial_db = temp.path().join("partial.sqlite");
+    let partial_db_str = partial_db.to_str().expect("utf-8 partial db path");
+    let mut partial_sink = SqliteMetadataSink::open_for_stream(&partial_db, "cam-partial")?;
+    partial_sink.on_records(&[
+        MetadataCommitRecord {
+            log_id: [0x42; 16],
+            commit_ordinal: 1,
+            sequence: 1,
+            locator: ArchiveLocator {
+                segment_id: 1,
+                segment_generation: 1,
+                file_offset: 64,
+                frame_len: 64,
+            },
+            frame_checksum: 0,
+            event_time_ns: 1,
+            commit_time_ns: 1,
+            source_pattern: ArchiveSourcePattern::PublishSubscribe,
+            source_service_id: 1,
+            source_instance_id: 1,
+            source_sequence: Some(1),
+        },
+        MetadataCommitRecord {
+            log_id: [0x42; 16],
+            commit_ordinal: 2,
+            sequence: 2,
+            locator: ArchiveLocator {
+                segment_id: 1,
+                segment_generation: 1,
+                file_offset: 128,
+                frame_len: 64,
+            },
+            frame_checksum: 0,
+            event_time_ns: 2,
+            commit_time_ns: 2,
+            source_pattern: ArchiveSourcePattern::PublishSubscribe,
+            source_service_id: 1,
+            source_instance_id: 1,
+            source_sequence: Some(2),
+        },
+    ])?;
+    partial_sink.upsert_indexer_state(&SqliteIndexerState {
+        stream_id: "cam-partial".to_string(),
+        log_id: [0x42; 16],
+        last_commit_ordinal: 4,
+        last_indexed_commit_ordinal: 2,
+        roll_file: "commit.idxlog".to_string(),
+        byte_offset: 0,
+        updated_at_ns: 1,
+        schema_version: SQLITE_SCHEMA_VERSION,
+    })?;
+
+    let not_indexed = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "query",
+            "locate-sequence",
+            "--db-path",
+            partial_db_str,
+            "--stream-id",
+            "cam-partial",
+            "--at",
+            "4",
+        ])
+        .output()?;
+    assert_failure_contains(&not_indexed, "\"NotIndexedYet\"", "query not indexed yet");
+    assert!(String::from_utf8_lossy(&not_indexed.stderr).contains("\"query_watermark\": 2"));
+
+    let bad_max_records = Command::new(query_bin)
+        .args([
+            "--format",
+            "JSON",
+            "index",
+            "catch-up",
+            "--stream-id",
+            "cam-a",
+            "--metadata-log-path",
+            metadata,
+            "--db-path",
+            db,
+            "--max-records",
+            "0",
+        ])
+        .output()?;
+    assert_failure_contains(
+        &bad_max_records,
+        "--max-records must be > 0",
+        "query zero max-records",
+    );
 
     Ok(())
 }

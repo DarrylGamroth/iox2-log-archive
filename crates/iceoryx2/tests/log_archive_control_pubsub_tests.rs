@@ -19,9 +19,10 @@ use iox2_log_archive_core::log_archive::{PersistenceMode, RecorderProfile};
 use iox2_log_archive_iceoryx2::{
     LOG_RECORDER_CONTROL_CMD_FLUSH, LOG_RECORDER_CONTROL_CMD_PAUSE,
     LOG_RECORDER_CONTROL_CMD_RESUME, LOG_RECORDER_CONTROL_CMD_STATUS,
-    LOG_RECORDER_CONTROL_CMD_STOP, LogRecorderControlClientConfig, LogRecorderControlError,
-    PubSubRecorderConfig, PubSubRecorderStopReason, record_publish_subscribe,
-    request_recorder_control,
+    LOG_RECORDER_CONTROL_CMD_STOP, LOG_RECORDER_CONTROL_NONE, LogRecorderControlClientConfig,
+    LogRecorderControlError, LogRecorderControlRequest, LogRecorderControlResponse,
+    PubSubRecorderConfig, PubSubRecorderStopReason, decode_optional_u64, encode_optional_u64,
+    log_recorder_control_service_name, record_publish_subscribe, request_recorder_control,
 };
 
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -120,6 +121,133 @@ fn pubsub_recorder_accepts_live_control_commands() {
     assert!(summary.messages_recorded >= 3);
     assert!(summary.dropped_while_paused >= 3);
     assert!(!summary.paused_at_shutdown);
+}
+
+#[test]
+fn pubsub_recorder_rejects_unknown_live_control_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    let service = unique_service_name("LogArchiveAdapter/PubSubControlInvalid");
+
+    let node = NodeBuilder::new().create::<ipc::Service>().unwrap();
+    let service_name = ServiceName::new(&service).unwrap();
+    let pubsub = node
+        .service_builder(&service_name)
+        .publish_subscribe::<u64>()
+        .open_or_create()
+        .unwrap();
+    let publisher = pubsub.publisher_builder().create().unwrap();
+
+    let recorder_service = service.clone();
+    let recorder_node_name = format!(
+        "iox2-log-archive-invalid-control-test-recorder-{}",
+        UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let recorder = thread::spawn(move || {
+        record_publish_subscribe(PubSubRecorderConfig {
+            service: recorder_service,
+            node_name: recorder_node_name,
+            storage_path,
+            metadata_log_path: metadata_path,
+            profile: RecorderProfile::Balanced,
+            persistence_mode: PersistenceMode::Async,
+            segment_bytes: 16 * 1024,
+            spare_preallocated_segments: 0,
+            segment_preallocate: false,
+            max_disk_bytes: None,
+            async_io_backend: None,
+            io_uring_queue_depth: None,
+            io_submit_batch_max: None,
+            io_cqe_batch_max: None,
+            io_uring_register_files: None,
+            checksum_mode: None,
+            subscriber_max_borrowed_samples: None,
+            out_of_space_policy: None,
+            metadata_log_roll_bytes: None,
+            metadata_log_max_bytes: None,
+            source_service_id: None,
+            cycle_time: Duration::from_millis(5),
+            max_messages: None,
+            timeout: Some(Duration::from_secs(30)),
+            flush_interval: Some(Duration::from_millis(25)),
+            ack_level: None,
+            shutdown_requested: None,
+        })
+    });
+
+    wait_for_control_status(&service);
+    publisher.send_copy(1).unwrap();
+    let invalid = control(&service, 999).unwrap_err();
+    assert!(matches!(invalid, LogRecorderControlError::InvalidInput(_)));
+    assert!(
+        invalid
+            .to_string()
+            .contains("daemon rejected command as invalid")
+    );
+
+    control(&service, LOG_RECORDER_CONTROL_CMD_STOP).unwrap();
+    let summary = recorder.join().unwrap().unwrap();
+    assert_eq!(summary.stop_reason, PubSubRecorderStopReason::ControlStop);
+}
+
+#[test]
+fn control_protocol_helpers_and_config_errors_are_stable() {
+    assert_eq!(
+        log_recorder_control_service_name("Service/Name/"),
+        "Service/Name/_log_recorder_control"
+    );
+    assert_eq!(encode_optional_u64(Some(7)), 7);
+    assert_eq!(encode_optional_u64(None), LOG_RECORDER_CONTROL_NONE);
+    assert_eq!(decode_optional_u64(9), Some(9));
+    assert_eq!(decode_optional_u64(LOG_RECORDER_CONTROL_NONE), None);
+
+    let request = LogRecorderControlRequest::new(LOG_RECORDER_CONTROL_CMD_STATUS);
+    assert_eq!(request.command, LOG_RECORDER_CONTROL_CMD_STATUS);
+    assert_eq!(request.reserved, 0);
+
+    let response = LogRecorderControlResponse::ok(0, 1, 2, 3, 4, 5, 6, 7, 8);
+    assert_eq!(response.committed_records, 1);
+    assert_eq!(response.payload_bytes_committed, 2);
+    assert_eq!(response.last_durable_data_sequence, 5);
+
+    let error_response = LogRecorderControlResponse::error(1);
+    assert_eq!(error_response.status, 1);
+    assert_eq!(
+        error_response.last_durable_commit_ordinal,
+        LOG_RECORDER_CONTROL_NONE
+    );
+
+    for (config, expected) in [
+        (
+            LogRecorderControlClientConfig {
+                service: "".to_string(),
+                node_name: "node".to_string(),
+                timeout: Duration::from_millis(1),
+            },
+            "service must not be empty",
+        ),
+        (
+            LogRecorderControlClientConfig {
+                service: "Service".to_string(),
+                node_name: "".to_string(),
+                timeout: Duration::from_millis(1),
+            },
+            "node_name must not be empty",
+        ),
+        (
+            LogRecorderControlClientConfig {
+                service: "Service".to_string(),
+                node_name: "node".to_string(),
+                timeout: Duration::ZERO,
+            },
+            "timeout must be greater than zero",
+        ),
+    ] {
+        let error = request_recorder_control(config, LOG_RECORDER_CONTROL_CMD_STATUS).unwrap_err();
+        assert!(matches!(error, LogRecorderControlError::InvalidInput(_)));
+        assert!(error.to_string().contains(expected));
+    }
 }
 
 fn wait_for_control_status(service: &str) -> iox2_log_archive_iceoryx2::LogRecorderControlResult {
