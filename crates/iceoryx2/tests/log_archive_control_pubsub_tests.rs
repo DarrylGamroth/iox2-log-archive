@@ -343,7 +343,7 @@ fn fake_control_response(
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            while let Some(active_request) = server.receive().unwrap() {
+            if let Some(active_request) = server.receive().unwrap() {
                 let _request = *active_request;
                 let _ = active_request.send_copy(response);
                 return;
