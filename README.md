@@ -1,6 +1,7 @@
 # iox2-log-archive
 
 [![CI](https://github.com/DarrylGamroth/iox2-log-archive/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DarrylGamroth/iox2-log-archive/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/DarrylGamroth/iox2-log-archive/branch/main/graph/badge.svg)](https://codecov.io/gh/DarrylGamroth/iox2-log-archive)
 
 Standalone high-rate recorder/replay tooling for iceoryx2 data.
 
