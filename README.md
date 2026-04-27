@@ -24,8 +24,18 @@ active scope.
 
 ```bash
 cargo check --workspace
-cargo test --workspace
+cargo test --workspace --all-targets --no-fail-fast
 ```
+
+Local coverage uses `cargo-llvm-cov`:
+
+```bash
+cargo install cargo-llvm-cov
+./scripts/coverage.sh
+```
+
+The default coverage command writes `target/llvm-cov/lcov.info`. For an HTML
+report, run `./scripts/coverage.sh --html`.
 
 The extraction currently pins `iceoryx2` to upstream commit
 `3107941ba2a40f2897c395289447d0f93664ad8c`. Replace that dependency with a

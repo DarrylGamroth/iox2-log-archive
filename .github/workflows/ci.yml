@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
 jobs:
   rust:
@@ -21,6 +22,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - name: Install LLVM tools
+        run: rustup component add llvm-tools-preview
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -36,3 +40,22 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets --no-fail-fast
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Coverage
+        run: ./scripts/coverage.sh
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: target/llvm-cov/lcov.info
+
+      - name: Upload coverage to Codecov
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v4
+        with:
+          files: target/llvm-cov/lcov.info
+          fail_ci_if_error: true
