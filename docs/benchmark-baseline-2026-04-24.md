@@ -154,8 +154,8 @@ Result:
 `strace -f -c` on a 20k x 4 KiB run confirmed the recorder is using io_uring:
 the run issued one `io_uring_setup`, three `io_uring_register` calls, and a few
 hundred `io_uring_enter` calls for tens of thousands of archive writes. That
-means io_uring is batching effectively; the remaining gap is mostly per-sample
-CPU work above the storage backend.
+only proves the backend is using io_uring; per-recorder submit/completion
+counters are a better signal for whether the queue is staying deep enough.
 
 ## Large-Payload Storage-Focused Checkpoint
 
@@ -212,6 +212,47 @@ Raw CRC32C throughput on `spiders` over the same 64 GiB byte count was
 `~7.06 GB/s`, so CRC computation itself is not the dominant cost. The observed
 checked-recording gap is mostly the extra memory read/cache pressure plus
 remaining recorder/transport overhead, not a slow checksum implementation.
+
+## IoUring Batching Checkpoint
+
+Host `spiders`, `/mnt/datadrive/tmp`, 256-deep io_uring queue, 64-submit batch,
+128-CQE batch. This checkpoint compares the blocking backend with the
+instrumented io_uring backend and uses cleanup after each run.
+
+The first instrumented run showed that some medium-payload cases reached queue
+depth once and then degraded into a near one-write-per-submit pattern. The
+backend now drains a batch of completions when the queue is full, instead of
+waiting for a single completion. This keeps subsequent producer bursts large
+enough to submit real batches.
+
+Core recorder synthetic path:
+
+| Payload | Blocking throughput | io_uring after batch-drain | io_uring avg writes/submit |
+| ---: | ---: | ---: | ---: |
+| 256 B | `~110.6 MB/s` | `~93.1 MB/s` | `255.7` |
+| 4 KiB | `~548.6 MB/s` | `~594.9 MB/s` | `253.0` |
+| 16 KiB | `~652.5 MB/s` | `~817.1 MB/s` | `237.6` |
+| 1 MiB | `~733.2 MB/s` | `~654.4 MB/s` | `85.7` |
+
+Live pub-sub loaned/external-payload path, checksum disabled:
+
+| Payload | Blocking throughput | io_uring after batch-drain | io_uring avg writes/submit |
+| ---: | ---: | ---: | ---: |
+| 256 B | `~45.5 MB/s` | `~85.1 MB/s` | `63.8` |
+| 4 KiB | `~408.7 MB/s` | `~539.0 MB/s` | `50.6` |
+| 16 KiB | `~703.6 MB/s` | `~807.5 MB/s` | `37.2` |
+| 1 MiB | `~949.1 MB/s` | `~827.5 MB/s` | `35.5` |
+
+Interpretation:
+
+- `io_uring` is useful for the small/medium live pub-sub path once batching is
+  preserved.
+- The 1 MiB path is not primarily fixed by submit batching; blocking buffered
+  writes remain faster in this bounded run.
+- Direct I/O remains a specialized tuning path and is not the default target.
+  The next broadly applicable optimization is to split recorder frame/metadata
+  preparation from I/O completion handling so large writes can stay queued while
+  the recorder prepares subsequent records.
 
 ## Reproduce
 

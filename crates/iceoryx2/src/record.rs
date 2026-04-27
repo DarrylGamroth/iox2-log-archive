@@ -182,6 +182,18 @@ pub struct PubSubRecorderSummary {
     pub out_of_space_events: u64,
     /// Metadata-log roll count.
     pub metadata_log_rolls: u64,
+    /// Number of async write operations enqueued to the I/O backend.
+    pub async_write_enqueued: u64,
+    /// Number of io_uring submit calls.
+    pub io_uring_submit_calls: u64,
+    /// Number of write SQEs submitted through io_uring.
+    pub io_uring_submitted_writes: u64,
+    /// Number of write CQEs reaped through io_uring.
+    pub io_uring_completed_writes: u64,
+    /// Number of io_uring calls that waited for at least one completion.
+    pub io_uring_wait_calls: u64,
+    /// Highest observed pending write count in the io_uring backend.
+    pub io_uring_pending_high_watermark: u64,
     /// Write amplification ratio.
     pub write_amplification_ratio: f64,
     /// Last durable data sequence.
@@ -546,6 +558,12 @@ pub fn record_publish_subscribe(
         preallocated_segments: stats.preallocated_segments,
         out_of_space_events: stats.out_of_space_events,
         metadata_log_rolls: stats.metadata_log_rolls,
+        async_write_enqueued: stats.async_write_enqueued,
+        io_uring_submit_calls: stats.io_uring_submit_calls,
+        io_uring_submitted_writes: stats.io_uring_submitted_writes,
+        io_uring_completed_writes: stats.io_uring_completed_writes,
+        io_uring_wait_calls: stats.io_uring_wait_calls,
+        io_uring_pending_high_watermark: stats.io_uring_pending_high_watermark,
         write_amplification_ratio: stats.amplification_ratio(),
         last_durable_data_sequence: recorder.last_durable_data_sequence(),
         last_durable_commit_ordinal: recorder.last_durable_commit_ordinal(),

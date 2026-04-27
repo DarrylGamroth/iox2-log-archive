@@ -18,7 +18,9 @@ use std::io::{Error, ErrorKind, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use super::common::{ArchiveRecorderError, AsyncIoBackend, EffectiveAsyncIoBackend};
+use super::common::{
+    ArchiveRecorderError, ArchiveRecorderStats, AsyncIoBackend, EffectiveAsyncIoBackend,
+};
 
 #[derive(Debug)]
 pub(super) struct BlockingIoBackend;
@@ -62,6 +64,18 @@ pub(super) struct IoUringBackend {
     pending_writes: BTreeMap<u64, PendingWrite>,
     pending_submit_count: u32,
     next_user_data: u64,
+    stats: IoUringBackendStats,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct IoUringBackendStats {
+    enqueued_writes: u64,
+    submit_calls: u64,
+    submitted_write_sqes: u64,
+    completed_writes: u64,
+    wait_calls: u64,
+    pending_high_watermark: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -325,6 +339,14 @@ impl RecorderIoBackend {
                 source,
             })
     }
+
+    pub(super) fn accumulate_stats(&self, stats: &mut ArchiveRecorderStats) {
+        match self {
+            Self::Blocking(_) => {}
+            #[cfg(target_os = "linux")]
+            Self::IoUring(backend) => backend.accumulate_stats(stats),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -349,7 +371,29 @@ impl IoUringBackend {
             pending_writes: BTreeMap::new(),
             pending_submit_count: 0,
             next_user_data: 1,
+            stats: IoUringBackendStats::default(),
         })
+    }
+
+    fn accumulate_stats(&self, stats: &mut ArchiveRecorderStats) {
+        stats.async_write_enqueued = stats
+            .async_write_enqueued
+            .saturating_add(self.stats.enqueued_writes);
+        stats.io_uring_submit_calls = stats
+            .io_uring_submit_calls
+            .saturating_add(self.stats.submit_calls);
+        stats.io_uring_submitted_writes = stats
+            .io_uring_submitted_writes
+            .saturating_add(self.stats.submitted_write_sqes);
+        stats.io_uring_completed_writes = stats
+            .io_uring_completed_writes
+            .saturating_add(self.stats.completed_writes);
+        stats.io_uring_wait_calls = stats
+            .io_uring_wait_calls
+            .saturating_add(self.stats.wait_calls);
+        stats.io_uring_pending_high_watermark = stats
+            .io_uring_pending_high_watermark
+            .max(self.stats.pending_high_watermark);
     }
 
     fn enqueue_write(
@@ -392,6 +436,7 @@ impl IoUringBackend {
             path: path.to_path_buf(),
         };
         self.pending_writes.insert(user_data, pending);
+        self.record_enqueued_write();
         self.push_write_entry(user_data)?;
 
         if self.pending_submit_count >= self.submit_batch_max {
@@ -400,7 +445,7 @@ impl IoUringBackend {
 
         if self.pending_writes.len() >= self.queue_depth as usize {
             self.submit_pending()?;
-            self.wait_for_and_reap(1)?;
+            self.wait_for_capacity()?;
         } else {
             self.reap_completed()?;
         }
@@ -450,6 +495,7 @@ impl IoUringBackend {
             path: write.path.to_path_buf(),
         };
         self.pending_writes.insert(user_data, pending);
+        self.record_enqueued_write();
         self.push_write_entry(user_data)?;
 
         if self.pending_submit_count >= self.submit_batch_max {
@@ -458,7 +504,7 @@ impl IoUringBackend {
 
         if self.pending_writes.len() >= self.queue_depth as usize {
             self.submit_pending()?;
-            self.wait_for_and_reap(1)?;
+            self.wait_for_capacity()?;
         } else {
             self.reap_completed()?;
         }
@@ -630,6 +676,7 @@ impl IoUringBackend {
         if self.pending_submit_count == 0 {
             return Ok(());
         }
+        let submitted = self.pending_submit_count as u64;
         self.ring
             .submit()
             .map_err(|source| ArchiveRecorderError::Io {
@@ -637,11 +684,14 @@ impl IoUringBackend {
                 path: PathBuf::from("<io_uring>"),
                 source,
             })?;
+        self.stats.submit_calls = self.stats.submit_calls.saturating_add(1);
+        self.stats.submitted_write_sqes = self.stats.submitted_write_sqes.saturating_add(submitted);
         self.pending_submit_count = 0;
         Ok(())
     }
 
     fn wait_for_and_reap(&mut self, min_completions: usize) -> Result<(), ArchiveRecorderError> {
+        self.stats.wait_calls = self.stats.wait_calls.saturating_add(1);
         self.ring
             .submit_and_wait(min_completions)
             .map_err(|source| ArchiveRecorderError::Io {
@@ -650,6 +700,15 @@ impl IoUringBackend {
                 source,
             })?;
         self.reap_completed()
+    }
+
+    fn wait_for_capacity(&mut self) -> Result<(), ArchiveRecorderError> {
+        let completion_target = self
+            .cqe_batch_max
+            .min(self.queue_depth)
+            .saturating_div(2)
+            .max(1) as usize;
+        self.wait_for_and_reap(completion_target.min(self.pending_writes.len()))
     }
 
     fn reap_completed(&mut self) -> Result<(), ArchiveRecorderError> {
@@ -686,10 +745,20 @@ impl IoUringBackend {
                 refresh_pending_iovecs(&mut pending);
                 self.pending_writes.insert(user_data, pending);
                 self.push_write_entry(user_data)?;
+            } else {
+                self.stats.completed_writes = self.stats.completed_writes.saturating_add(1);
             }
         }
 
         Ok(())
+    }
+
+    fn record_enqueued_write(&mut self) {
+        self.stats.enqueued_writes = self.stats.enqueued_writes.saturating_add(1);
+        self.stats.pending_high_watermark = self
+            .stats
+            .pending_high_watermark
+            .max(self.pending_writes.len() as u64);
     }
 
     unsafe fn submit_direct_and_wait_one(

@@ -452,6 +452,18 @@ pub struct ArchiveRecorderStats {
     pub out_of_space_events: u64,
     /// Number of commit-log roll operations.
     pub metadata_log_rolls: u64,
+    /// Number of async write operations enqueued to the I/O backend.
+    pub async_write_enqueued: u64,
+    /// Number of io_uring submit calls.
+    pub io_uring_submit_calls: u64,
+    /// Number of write SQEs submitted through io_uring.
+    pub io_uring_submitted_writes: u64,
+    /// Number of write CQEs reaped through io_uring.
+    pub io_uring_completed_writes: u64,
+    /// Number of io_uring calls that waited for at least one completion.
+    pub io_uring_wait_calls: u64,
+    /// Highest observed pending write count in the io_uring backend.
+    pub io_uring_pending_high_watermark: u64,
 }
 
 impl ArchiveRecorderStats {

@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use iceoryx2_bb_testing::assert_that;
 use iox2_log_archive_core::log_archive::{
-    ArchiveRecorderBuilder, ArchiveRecorderError, ArchiveReplayerBuilder, ArchiveSourcePattern,
-    AsyncIoBackend, ChecksumMode, EffectiveAsyncIoBackend, PersistenceMode,
+    ArchiveRecorderBuilder, ArchiveRecorderError, ArchiveRecorderStats, ArchiveReplayerBuilder,
+    ArchiveSourcePattern, AsyncIoBackend, ChecksumMode, EffectiveAsyncIoBackend, PersistenceMode,
     PublishSubscribeExternalPayloadInput, PublishSubscribeRecordInput, RecorderProfile,
     ReplayBudget, ReplayFrameBuffer, decode_adapter_user_header,
 };
@@ -37,7 +37,11 @@ struct LogRecordInput<'a> {
 }
 
 type ReplayedRecord = (u64, Vec<u8>, Vec<u8>);
-type RecordAndReplayResult = (EffectiveAsyncIoBackend, Vec<ReplayedRecord>);
+type RecordAndReplayResult = (
+    EffectiveAsyncIoBackend,
+    ArchiveRecorderStats,
+    Vec<ReplayedRecord>,
+);
 
 trait LegacyLogAppendExt {
     fn append_log_record(
@@ -110,6 +114,7 @@ fn record_and_replay(
             .unwrap();
     }
     recorder.finalize().unwrap();
+    let stats = recorder.stats();
 
     let replayer = ArchiveReplayerBuilder::new(storage_path)
         .metadata_log_path(metadata_path)
@@ -122,7 +127,7 @@ fn record_and_replay(
         .map(|frame| (frame.sequence, frame.user_header, frame.payload))
         .collect();
 
-    (effective_backend, replayed)
+    (effective_backend, stats, replayed)
 }
 
 #[test]
@@ -198,14 +203,14 @@ fn log_archive_phase6_backend_parity_between_blocking_and_io_uring() {
         let records = 768u64;
         let payload_len = 1536usize;
 
-        let (blocking_backend, blocking_replay) = record_and_replay(
+        let (blocking_backend, blocking_stats, blocking_replay) = record_and_replay(
             &temp.path().join("archive_blocking"),
             &temp.path().join("metadata_blocking"),
             AsyncIoBackend::Blocking,
             records,
             payload_len,
         );
-        let (io_uring_backend, io_uring_replay) = record_and_replay(
+        let (io_uring_backend, io_uring_stats, io_uring_replay) = record_and_replay(
             &temp.path().join("archive_io_uring"),
             &temp.path().join("metadata_io_uring"),
             AsyncIoBackend::IoUringRequired,
@@ -216,6 +221,15 @@ fn log_archive_phase6_backend_parity_between_blocking_and_io_uring() {
         assert_that!(blocking_backend, eq EffectiveAsyncIoBackend::Blocking);
         assert_that!(io_uring_backend, eq EffectiveAsyncIoBackend::IoUring);
         assert_that!(io_uring_replay, eq blocking_replay);
+        assert_that!(blocking_stats.async_write_enqueued, eq 0);
+        assert_that!(blocking_stats.io_uring_submit_calls, eq 0);
+        assert_that!(io_uring_stats.async_write_enqueued > 0, eq true);
+        assert_that!(io_uring_stats.io_uring_submit_calls > 0, eq true);
+        assert_that!(
+            io_uring_stats.io_uring_completed_writes,
+            eq io_uring_stats.async_write_enqueued
+        );
+        assert_that!(io_uring_stats.io_uring_pending_high_watermark > 1, eq true);
     }
 }
 
@@ -225,7 +239,7 @@ fn log_archive_blocking_backend_sustained_ingest_preserves_replay_integrity() {
     let records = 1_024u64;
     let payload_len = 2_048usize;
 
-    let (effective_backend, replayed) = record_and_replay(
+    let (effective_backend, stats, replayed) = record_and_replay(
         &temp.path().join("archive_blocking_sustained"),
         &temp.path().join("metadata_blocking_sustained"),
         AsyncIoBackend::Blocking,
@@ -234,6 +248,7 @@ fn log_archive_blocking_backend_sustained_ingest_preserves_replay_integrity() {
     );
 
     assert_that!(effective_backend, eq EffectiveAsyncIoBackend::Blocking);
+    assert_that!(stats.async_write_enqueued, eq 0);
     assert_that!(replayed.len(), eq records as usize);
     for (index, (sequence, _user_header, payload)) in replayed.iter().enumerate() {
         let expected_sequence = (index + 1) as u64;

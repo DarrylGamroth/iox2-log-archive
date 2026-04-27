@@ -160,9 +160,14 @@ fn run<const PAYLOAD_BYTES: usize>(config: BenchmarkConfig) -> Result<(), String
     let publish_elapsed = publish_start.elapsed();
     let elapsed_seconds = summary.elapsed.as_secs_f64().max(1e-9);
     let wall_seconds = publish_elapsed.as_secs_f64().max(1e-9);
+    let io_uring_avg_writes_per_submit = if summary.io_uring_submit_calls == 0 {
+        0.0
+    } else {
+        summary.io_uring_submitted_writes as f64 / summary.io_uring_submit_calls as f64
+    };
 
     println!(
-        "{{\"records\":{},\"payload_bytes\":{},\"sent_messages\":{},\"elapsed_seconds\":{:.6},\"wall_seconds\":{:.6},\"records_per_second\":{:.3},\"payload_bytes_per_second\":{:.3},\"wall_records_per_second\":{:.3},\"wall_payload_bytes_per_second\":{:.3},\"effective_backend\":\"{:?}\",\"configured_backend\":\"{:?}\",\"profile\":\"{:?}\",\"publish_mode\":\"{:?}\",\"checksum_mode\":\"{:?}\",\"io_uring_queue_depth\":{},\"io_submit_batch_max\":{},\"io_cqe_batch_max\":{},\"subscriber_max_borrowed_samples\":{},\"external_payload_fast_path\":{},\"segment_bytes\":{},\"data_bytes_written\":{},\"metadata_bytes_written\":{},\"amplification_ratio\":{:.6},\"stop_reason\":\"{:?}\"}}",
+        "{{\"records\":{},\"payload_bytes\":{},\"sent_messages\":{},\"elapsed_seconds\":{:.6},\"wall_seconds\":{:.6},\"records_per_second\":{:.3},\"payload_bytes_per_second\":{:.3},\"wall_records_per_second\":{:.3},\"wall_payload_bytes_per_second\":{:.3},\"effective_backend\":\"{:?}\",\"configured_backend\":\"{:?}\",\"profile\":\"{:?}\",\"publish_mode\":\"{:?}\",\"checksum_mode\":\"{:?}\",\"io_uring_queue_depth\":{},\"io_submit_batch_max\":{},\"io_cqe_batch_max\":{},\"subscriber_max_borrowed_samples\":{},\"external_payload_fast_path\":{},\"segment_bytes\":{},\"data_bytes_written\":{},\"metadata_bytes_written\":{},\"amplification_ratio\":{:.6},\"async_write_enqueued\":{},\"io_uring_submit_calls\":{},\"io_uring_submitted_writes\":{},\"io_uring_completed_writes\":{},\"io_uring_wait_calls\":{},\"io_uring_pending_high_watermark\":{},\"io_uring_avg_writes_per_submit\":{:.3},\"stop_reason\":\"{:?}\"}}",
         summary.committed_records,
         summary.payload_bytes_committed,
         sent,
@@ -186,6 +191,13 @@ fn run<const PAYLOAD_BYTES: usize>(config: BenchmarkConfig) -> Result<(), String
         summary.data_bytes_written,
         summary.metadata_bytes_written,
         summary.write_amplification_ratio,
+        summary.async_write_enqueued,
+        summary.io_uring_submit_calls,
+        summary.io_uring_submitted_writes,
+        summary.io_uring_completed_writes,
+        summary.io_uring_wait_calls,
+        summary.io_uring_pending_high_watermark,
+        io_uring_avg_writes_per_submit,
         summary.stop_reason,
     );
 

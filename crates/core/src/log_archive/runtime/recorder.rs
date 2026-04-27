@@ -888,7 +888,9 @@ fn recover_existing_archive(
 impl ArchiveRecorder {
     /// Returns current recorder stats.
     pub fn stats(&self) -> ArchiveRecorderStats {
-        self.stats
+        let mut stats = self.stats;
+        self.io_backend.accumulate_stats(&mut stats);
+        stats
     }
 
     /// Returns startup recovery status.

@@ -388,6 +388,10 @@ crates/core/scripts/run_fio_baseline.sh /tmp/log-archive-fio
 ```
 
 Both scripts emit JSON reports with host and storage metadata.
+Recorder benchmark output includes io_uring counters for submit calls,
+submitted/completed write SQEs, wait calls, pending-write high-watermark, and
+average writes per submit. Use those counters to distinguish true async
+batching from a queue that has degraded into submit/wait-per-record behavior.
 
 ## Current Limits
 

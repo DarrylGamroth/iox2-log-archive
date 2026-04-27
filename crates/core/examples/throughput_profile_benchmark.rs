@@ -217,9 +217,14 @@ fn main() -> Result<(), String> {
     let stats = recorder.stats();
     let payload_bytes_per_second = stats.payload_bytes_committed as f64 / elapsed_seconds;
     let records_per_second = stats.committed_records as f64 / elapsed_seconds;
+    let io_uring_avg_writes_per_submit = if stats.io_uring_submit_calls == 0 {
+        0.0
+    } else {
+        stats.io_uring_submitted_writes as f64 / stats.io_uring_submit_calls as f64
+    };
 
     println!(
-        "{{\"records\":{},\"payload_bytes\":{},\"elapsed_seconds\":{:.6},\"records_per_second\":{:.3},\"payload_bytes_per_second\":{:.3},\"effective_backend\":\"{:?}\",\"configured_backend\":\"{:?}\",\"profile\":\"{:?}\",\"segment_bytes\":{},\"metadata_bytes_written\":{},\"data_bytes_written\":{},\"amplification_ratio\":{:.6}}}",
+        "{{\"records\":{},\"payload_bytes\":{},\"elapsed_seconds\":{:.6},\"records_per_second\":{:.3},\"payload_bytes_per_second\":{:.3},\"effective_backend\":\"{:?}\",\"configured_backend\":\"{:?}\",\"profile\":\"{:?}\",\"segment_bytes\":{},\"metadata_bytes_written\":{},\"data_bytes_written\":{},\"amplification_ratio\":{:.6},\"async_write_enqueued\":{},\"io_uring_submit_calls\":{},\"io_uring_submitted_writes\":{},\"io_uring_completed_writes\":{},\"io_uring_wait_calls\":{},\"io_uring_pending_high_watermark\":{},\"io_uring_avg_writes_per_submit\":{:.3}}}",
         stats.committed_records,
         stats.payload_bytes_committed,
         elapsed_seconds,
@@ -232,6 +237,13 @@ fn main() -> Result<(), String> {
         stats.metadata_bytes_written,
         stats.data_bytes_written,
         stats.amplification_ratio(),
+        stats.async_write_enqueued,
+        stats.io_uring_submit_calls,
+        stats.io_uring_submitted_writes,
+        stats.io_uring_completed_writes,
+        stats.io_uring_wait_calls,
+        stats.io_uring_pending_high_watermark,
+        io_uring_avg_writes_per_submit,
     );
 
     Ok(())
