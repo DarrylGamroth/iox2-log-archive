@@ -3,12 +3,12 @@
 ## Status
 - Draft
 - Target branch: `design/log-archive-userland`
-- Last updated: 2026-04-23
+- Last updated: 2026-04-27
 
 ## Related Documents
-- Archive/replay plan: `doc/design-documents/log-archive-v2.md`
-- Pub/sub V1 plan: `doc/design-documents/log-archive-pubsub-v1-plan.md`
-- Historical Log v1 pattern: `doc/design-documents/log-messaging-pattern.md` (retired on `design/log-archive-pubsub-v1`)
+- Archive/replay plan: `docs/log-archive-v2.md`
+- Pub/sub V1 plan: `docs/log-archive-pubsub-v1-plan.md`
+- Historical Log v1 pattern: `historical log-messaging-pattern design` (retired on `design/log-archive-pubsub-v1`)
 
 ## Scope
 Define how a high-rate userland recorder core integrates with an application-owned metadata system (for example SQLite) without putting database work in the recorder hot path.
@@ -444,7 +444,7 @@ Recovery invariants:
 
 ## Planning and Tracking
 - Canonical implementation plan and progress tracking are maintained in:
-- `doc/design-documents/log-archive-v2.md`
+- `docs/log-archive-v2.md`
 - This document is a companion contract/specification focused on metadata interfaces, file/schema formats, and operational invariants.
 - Metadata implementation work maps primarily to:
 - `log-archive-v2` Phase 5 (Metadata Integration and Tooling)

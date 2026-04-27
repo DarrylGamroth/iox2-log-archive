@@ -2,12 +2,12 @@
 
 ## Status
 - Implemented
-- Last updated: 2026-02-09
+- Last updated: 2026-04-27
 - Target branch: `design/log-archive-userland`
 - Depends on:
-- `doc/design-documents/log-archive-v2.md`
-- `doc/design-documents/log-archive-userland-metadata.md`
-- `doc/design-documents/log-replay-cli.md`
+  - `docs/log-archive-v2.md`
+  - `docs/log-archive-userland-metadata.md`
+  - `docs/log-replay-cli.md`
 - Implementation progress: Phase 0 complete, Phase 1 complete, Phase 2 complete, Phase 3 complete, Phase 4 complete, Phase 5 complete, Phase 6 complete, Phase 7 complete.
 
 ## Scope

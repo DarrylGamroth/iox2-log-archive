@@ -2,7 +2,7 @@
 
 ## Status
 - Implemented
-- Last updated: 2026-04-23
+- Last updated: 2026-04-27
 - Branch: `design/log-archive-pubsub-v1`
 - Base: `main` (upstream HEAD)
 

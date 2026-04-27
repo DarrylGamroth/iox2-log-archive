@@ -12,7 +12,7 @@ Location: `crates/core`
 - Persistence modes: `volatile`, `async`, `sync`
 - Async backend policy: io_uring preferred/required, or blocking fallback
 - Recorder/replay surfaces for canonical archive records; iceoryx2 `publish_subscribe` capture and rematerialization live in adapter/CLI crates
-- `log` and `pipeline` adapters are deferred to later updates
+- Core `Log` messaging pattern support is retired; the active integration scope is `publish_subscribe`
 - Metadata indexer (`commit.idxlog` tail + persisted watermark)
 - CLI tools: `iox2-log-recorder`, `iox2-log-control`, `iox2-log-admin`, `iox2-log-query`, `iox2-log-replay`
 
@@ -129,6 +129,21 @@ cargo run -p iox2-log-archive-cli --bin iox2-log-replay -- \
   --metadata-log-path "$METADATA_PATH" \
   --to publish-subscribe \
   --service "$SERVICE" \
+  all
+```
+
+Follow newly committed records while a recorder is active:
+
+```bash
+cargo run -p iox2-log-archive-cli --bin iox2-log-replay -- \
+  --format JSON \
+  replay \
+  --storage-path "$STORAGE_PATH" \
+  --metadata-log-path "$METADATA_PATH" \
+  --to publish-subscribe \
+  --service "$SERVICE" \
+  --follow \
+  --follow-poll-ms 100 \
   all
 ```
 
@@ -342,8 +357,8 @@ cargo test -p iox2-log-archive-core --tests -- --nocapture
 Run CLI integration tests:
 
 ```bash
-cargo test -p iceoryx2-cli --test iox2_log_control_cli_tests -- --nocapture
-cargo test -p iceoryx2-cli --test iox2_log_recorder_cli_tests -- --nocapture
+cargo test -p iox2-log-archive-cli --test cli_pipe_tests -- --nocapture
+cargo test -p iox2-log-archive-iceoryx2 --tests -- --nocapture
 ```
 
 ## Throughput and Storage Baselines
@@ -371,5 +386,6 @@ Both scripts emit JSON reports with host and storage metadata.
 
 ## Design References
 
-- `doc/design-documents/log-archive-v2.md`
-- `doc/design-documents/log-archive-v2-traceability.md`
+- `docs/log-archive-v2.md`
+- `docs/log-archive-pubsub-v1-plan.md`
+- `docs/cli-reference.md`

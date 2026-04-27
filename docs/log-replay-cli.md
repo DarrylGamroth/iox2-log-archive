@@ -2,10 +2,10 @@
 
 ## Status
 - Implemented
-- Last updated: 2026-04-23
+- Last updated: 2026-04-27
 - Target branch: `design/log-archive-userland`
-- Depends on: `doc/design-documents/log-archive-v2.md`
-- Active scope note: narrowed by `doc/design-documents/log-archive-pubsub-v1-plan.md`; Log rematerialization is retired on `design/log-archive-pubsub-v1`.
+- Depends on: `docs/log-archive-v2.md`
+- Active scope note: narrowed by `docs/log-archive-pubsub-v1-plan.md`; Log rematerialization is retired on `design/log-archive-pubsub-v1`.
 - Implementation progress: Phase 0 complete, Phase 1 complete, Phase 2 complete, Phase 3 complete, Phase 4 complete, Phase 5 complete.
 
 ## Scope
@@ -44,7 +44,7 @@ appear in all capitals.
 
 ## Requirements
 - `LRC-001`: A separate executable `MUST` be provided as `iox2-log-replay`.
-- `LRC-002`: The CLI `MUST` support one-shot replay operations (no background daemon required).
+- `LRC-002`: The CLI `MUST` support one-shot replay operations without a background daemon; live replay is optional and explicit via follow mode.
 - `LRC-003`: Selector input `MUST` be expressed as explicit selector subcommands and `MUST` support:
   - `sequence --at <u64>`,
   - `range --from <u64> --count <usize>`,
@@ -199,14 +199,17 @@ Example summary payload:
   "metadata_log_path": "/tmp/meta",
   "destination": "publish-subscribe",
   "service": "My/Replay/Service",
-  "selector_source": "stdin:ndjson",
+  "selector_source": "selectors:stdin:ndjson",
   "rate_mode": "fast",
+  "live_mode": true,
   "selected": 1024,
   "emitted": 1020,
   "skipped_missing": 4,
   "errors": 0,
   "bytes_emitted": 16777216,
-  "elapsed_ms": 245
+  "elapsed_ms": 245,
+  "last_visible_sequence": 2048,
+  "last_visible_commit_ordinal": 2048
 }
 ```
 
@@ -237,7 +240,7 @@ iox2-log-query query locate-window \
   - no unresolved naming collisions with existing CLIs.
 
 ### Phase 1: CLI Skeleton + Parsing (Completed 2026-02-09)
-- Add binary `iceoryx2-cli/iox2-log-replay` with `cli.rs`, `command.rs`, `main.rs`.
+- Add binary `crates/cli/src/iox2-log-replay` with `cli.rs`, `command.rs`, `main.rs`.
 - Implement selector subcommands (`sequence`, `range`, `locator`, `selectors`).
 - Implement stdin/file parser for NDJSON.
 - Exit criteria:
@@ -268,7 +271,7 @@ iox2-log-query query locate-window \
   - recorded/fixed pacing tests pass within tolerance,
   - long stdin streams run without unbounded memory growth.
 
-### Phase 5: Hardening and Docs (Completed 2026-02-09)
+### Phase 5: Hardening and Docs (Completed 2026-02-09; refreshed 2026-04-27)
 - Add CLI integration tests for piped selectors and mixed selector types.
 - Add README examples and troubleshooting.
 - Update traceability matrix with `LRC-*` requirement IDs.
@@ -281,8 +284,8 @@ iox2-log-query query locate-window \
 - Direct range replay to stdout.
 - Direct locator replay to stdout.
 - NDJSON stdin selectors replay to stdout.
-- NDJSON stdin selectors rematerialize to log.
 - NDJSON stdin selectors rematerialize to publish-subscribe.
+- Follow replay for `all`, `sequence`, and `range`.
 - Missing selector behavior with and without `--skip-missing`.
 - Deterministic exit codes and machine-readable errors.
 
