@@ -220,6 +220,34 @@ fn log_archive_phase6_backend_parity_between_blocking_and_io_uring() {
 }
 
 #[test]
+fn log_archive_blocking_backend_sustained_ingest_preserves_replay_integrity() {
+    let temp = tempfile::tempdir().unwrap();
+    let records = 1_024u64;
+    let payload_len = 2_048usize;
+
+    let (effective_backend, replayed) = record_and_replay(
+        &temp.path().join("archive_blocking_sustained"),
+        &temp.path().join("metadata_blocking_sustained"),
+        AsyncIoBackend::Blocking,
+        records,
+        payload_len,
+    );
+
+    assert_that!(effective_backend, eq EffectiveAsyncIoBackend::Blocking);
+    assert_that!(replayed.len(), eq records as usize);
+    for (index, (sequence, _user_header, payload)) in replayed.iter().enumerate() {
+        let expected_sequence = (index + 1) as u64;
+        assert_that!(*sequence, eq expected_sequence);
+        assert_that!(payload.len(), eq payload_len);
+        assert_that!(payload[0], eq payload_byte(expected_sequence, 0));
+        assert_that!(
+            payload[payload_len - 1],
+            eq payload_byte(expected_sequence, payload_len - 1)
+        );
+    }
+}
+
+#[test]
 fn log_archive_phase6_io_uring_external_payload_writev_persists_records() {
     #[cfg(not(target_os = "linux"))]
     {

@@ -369,6 +369,18 @@ Recorder throughput benchmark:
 crates/core/scripts/run_throughput_profile_benchmark.sh /tmp/log-archive-bench
 ```
 
+Blocking backend throughput reference:
+
+```bash
+BACKEND=blocking \
+PROFILE=throughput \
+crates/core/scripts/run_throughput_profile_benchmark.sh /tmp/log-archive-bench-blocking
+```
+
+Use the blocking benchmark as the portability baseline on Linux. It exercises
+the same archive format and replay path without `io_uring`, and CI runs a small
+blocking-backend benchmark smoke test to keep the script and backend path live.
+
 `fio` sequential-write baseline (requires `fio`):
 
 ```bash

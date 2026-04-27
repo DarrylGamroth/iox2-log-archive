@@ -15,6 +15,12 @@ The test suite includes the pub-sub end-to-end path:
 
 `producer -> recorder -> SQLite indexer -> selector query -> replay by locator -> pub-sub rematerialization -> subscriber`.
 
+Linux CI additionally validates the regular blocking I/O backend with a
+sustained ingest/replay integrity test and a small `BACKEND=blocking`
+throughput benchmark smoke run. macOS and Windows CI run portable core/SQLite
+checks only; Linux remains the authoritative full integration and coverage
+platform.
+
 ## Compatibility Policy
 
 - Archive major version `1` is the current compatible format family.

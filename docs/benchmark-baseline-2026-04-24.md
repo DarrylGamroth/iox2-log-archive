@@ -67,6 +67,26 @@ Result:
 Core recorder throughput is `~77.2%` of the fio sequential-write baseline on
 this host for the tested 4 KiB synthetic payload profile.
 
+## Blocking Backend Reference
+
+The regular blocking I/O backend is the portability baseline and should be
+benchmarked on Linux alongside the default `auto`/`io_uring` path when evaluating
+a storage profile. Use the same benchmark harness with `BACKEND=blocking`:
+
+```bash
+RECORDS=100000 \
+PAYLOAD_BYTES=4096 \
+SEGMENT_BYTES=67108864 \
+BACKEND=blocking \
+PROFILE=throughput \
+crates/core/scripts/run_throughput_profile_benchmark.sh \
+  target/benchmarks/core-throughput-100k-4k-blocking
+```
+
+CI also runs a small Linux blocking-backend benchmark smoke test so the script,
+blocking backend, and report generation remain exercised even though release
+acceptance numbers should still come from target storage volumes.
+
 ## Live Pub-Sub Recorder Synthetic Baseline
 
 This measures the full live path:

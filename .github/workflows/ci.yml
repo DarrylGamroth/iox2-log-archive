@@ -44,6 +44,24 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --no-fail-fast
 
+      - name: Blocking backend validation
+        run: |
+          cargo test -p iox2-log-archive-core \
+            --test log_archive_hardening_and_performance_tests \
+            log_archive_blocking_backend_sustained_ingest_preserves_replay_integrity \
+            -- --exact
+
+      - name: Blocking backend benchmark smoke
+        run: |
+          RECORDS=1000 \
+          PAYLOAD_BYTES=1024 \
+          SEGMENT_BYTES=1048576 \
+          BACKEND=blocking \
+          PROFILE=throughput \
+          CLEANUP_ARCHIVE=true \
+          crates/core/scripts/run_throughput_profile_benchmark.sh \
+            target/benchmarks/ci-blocking-backend-smoke
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
@@ -62,3 +80,32 @@ jobs:
           files: target/llvm-cov/lcov.info
           fail_ci_if_error: true
           use_oidc: true
+
+  portable-core:
+    name: Portable Core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check portable crates
+        run: |
+          cargo check -p iox2-log-archive-core --lib --examples
+          cargo check -p iox2-log-archive-sqlite --lib
+
+      - name: Test portable crates
+        run: |
+          cargo test -p iox2-log-archive-core --lib
+          cargo test -p iox2-log-archive-sqlite --lib
