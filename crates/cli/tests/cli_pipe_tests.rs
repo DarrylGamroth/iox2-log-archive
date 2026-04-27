@@ -10,15 +10,30 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
+use iceoryx2::port::subscriber::Subscriber;
+use iceoryx2::prelude::*;
+use iceoryx2::service::builder::{CustomHeaderMarker, CustomPayloadMarker};
+use iceoryx2::service::static_config::message_type_details::{TypeDetail, TypeName, TypeVariant};
 use iox2_log_archive_core::log_archive::{
     ArchiveLocator, ArchiveMetadataSink, ArchiveRecorderBuilder, ArchiveSourcePattern,
     ChecksumMode, MetadataCommitRecord, PersistenceMode, PublishSubscribeRecordInput,
 };
 use iox2_log_archive_sqlite::{SQLITE_SCHEMA_VERSION, SqliteIndexerState, SqliteMetadataSink};
+
+static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn unique_service_name(prefix: &str) -> String {
+    let suffix = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}/{}/{}", std::process::id(), suffix)
+}
 
 fn assert_success(output: &Output, context: &str) {
     assert!(
@@ -27,6 +42,64 @@ fn assert_success(output: &Output, context: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn wait_for_child(mut child: Child, context: &str) -> Result<Output, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            panic!(
+                "{context} did not exit before timeout\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn byte_slice_service_details(user_header_size: usize) -> (TypeDetail, TypeDetail) {
+    let mut payload = TypeDetail::new::<()>(TypeVariant::Dynamic);
+    iceoryx2::testing::type_detail_set_size(&mut payload, 1);
+    iceoryx2::testing::type_detail_set_alignment(&mut payload, 1);
+    iceoryx2::testing::type_detail_set_name(
+        &mut payload,
+        TypeName::from_str_truncated("u8").unwrap(),
+    );
+
+    let mut user_header = TypeDetail::new::<()>(TypeVariant::FixedSize);
+    iceoryx2::testing::type_detail_set_size(&mut user_header, user_header_size);
+    iceoryx2::testing::type_detail_set_alignment(&mut user_header, 1);
+    iceoryx2::testing::type_detail_set_name(
+        &mut user_header,
+        TypeName::from_str_truncated("()").unwrap(),
+    );
+
+    (payload, user_header)
+}
+
+fn receive_payload(
+    subscriber: &Subscriber<ipc::Service, [CustomPayloadMarker], CustomHeaderMarker>,
+) -> Vec<u8> {
+    for _ in 0..2500 {
+        if let Some(sample) = unsafe { subscriber.receive_custom_payload().unwrap() } {
+            let payload = unsafe {
+                core::slice::from_raw_parts(
+                    sample.payload().as_ptr().cast::<u8>(),
+                    sample.payload().len(),
+                )
+            };
+            return payload.to_vec();
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    panic!("timed out waiting for publish-subscribe replay payload");
 }
 
 fn assert_failure_contains(output: &Output, expected: &str, context: &str) {
@@ -128,6 +201,48 @@ fn index_archive(
         .output()?;
     assert_success(&output, "index catch-up");
     Ok(())
+}
+
+fn wait_for_control_cli_status(
+    service: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let output = control_cli(service, "status")?;
+        if output.status.success() {
+            return Ok(serde_json::from_slice(&output.stdout)?);
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for control CLI status\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn control_cli(service: &str, command: &str) -> Result<Output, Box<dyn std::error::Error>> {
+    let node_name = format!(
+        "iox2-log-archive-cli-control-test-{}",
+        UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    Ok(Command::new(env!("CARGO_BIN_EXE_iox2-log-control"))
+        .args([
+            "--format",
+            "JSON",
+            command,
+            "--service",
+            service,
+            "--node-name",
+            &node_name,
+            "--timeout-ms",
+            "1000",
+        ])
+        .output()?)
 }
 
 fn first_locator_from_range(
@@ -1454,6 +1569,236 @@ fn replay_selector_files_cover_csv_and_ndjson_validation() -> Result<(), Box<dyn
         "failed to open selector file",
         "missing selector file",
     );
+
+    Ok(())
+}
+
+#[test]
+fn query_index_run_emits_progress_until_stopped() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    let db_path = temp.path().join("query-run.sqlite");
+    create_archive(&storage_path, &metadata_path)?;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_iox2-log-query"))
+        .args([
+            "--format",
+            "JSON",
+            "index",
+            "run",
+            "--stream-id",
+            "cam-run",
+            "--metadata-log-path",
+            metadata_path.to_str().expect("utf-8 metadata path"),
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+            "--poll-interval-ms",
+            "10",
+            "--batch-max-records",
+            "2",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let mut seen = String::new();
+        for line in reader.lines() {
+            let line = line.expect("query index-run stdout line");
+            seen.push_str(&line);
+            seen.push('\n');
+            if line.contains("\"processed_records\"") {
+                let _ = tx.send(seen);
+                return;
+            }
+        }
+        let _ = tx.send(seen);
+    });
+
+    let observed = match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timed out waiting for index-run output: {error}");
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(observed.contains("\"operation\": \"index-run\""));
+    assert!(observed.contains("\"processed_records\""));
+
+    Ok(())
+}
+
+#[test]
+fn control_cli_commands_succeed_against_live_recorder() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    let service = unique_service_name("LogArchiveCli/Control/Source");
+
+    let node = NodeBuilder::new().create::<ipc::Service>()?;
+    let pubsub = node
+        .service_builder(&ServiceName::new(&service)?)
+        .publish_subscribe::<u64>()
+        .open_or_create()?;
+    let publisher = pubsub.publisher_builder().create()?;
+
+    let recorder_node = format!(
+        "iox2-log-archive-cli-recorder-{}",
+        UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let recorder = Command::new(env!("CARGO_BIN_EXE_iox2-log-recorder"))
+        .args([
+            "--format",
+            "JSON",
+            "publish-subscribe",
+            "--service",
+            &service,
+            "--node-name",
+            &recorder_node,
+            "--storage-path",
+            storage_path.to_str().expect("utf-8 storage path"),
+            "--metadata-log-path",
+            metadata_path.to_str().expect("utf-8 metadata path"),
+            "--segment-bytes",
+            "16384",
+            "--spare-preallocated-segments",
+            "0",
+            "--segment-preallocate",
+            "false",
+            "--cycle-time-ms",
+            "5",
+            "--timeout-ms",
+            "30000",
+            "--flush-interval-ms",
+            "10",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let status = wait_for_control_cli_status(&service)?;
+    assert_eq!(status["operation"], "status");
+    assert_eq!(status["is_paused"], false);
+
+    let pause = control_cli(&service, "pause")?;
+    assert_success(&pause, "control pause");
+    let pause_json: serde_json::Value = serde_json::from_slice(&pause.stdout)?;
+    assert_eq!(pause_json["operation"], "pause");
+    assert_eq!(pause_json["is_paused"], true);
+
+    for value in 1..=8u64 {
+        publisher.send_copy(value)?;
+    }
+
+    let resume = control_cli(&service, "resume")?;
+    assert_success(&resume, "control resume");
+    let resume_json: serde_json::Value = serde_json::from_slice(&resume.stdout)?;
+    assert_eq!(resume_json["operation"], "resume");
+    assert_eq!(resume_json["is_paused"], false);
+
+    for value in 10..=16u64 {
+        publisher.send_copy(value)?;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let flushed = loop {
+        let flush = control_cli(&service, "flush")?;
+        assert_success(&flush, "control flush");
+        let flush_json: serde_json::Value = serde_json::from_slice(&flush.stdout)?;
+        if flush_json["committed_records"].as_u64().unwrap_or(0) > 0 {
+            break flush_json;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recorder did not commit live samples"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(flushed["operation"], "flush");
+
+    let stop = control_cli(&service, "stop")?;
+    assert_success(&stop, "control stop");
+    let stop_json: serde_json::Value = serde_json::from_slice(&stop.stdout)?;
+    assert_eq!(stop_json["operation"], "stop");
+
+    let recorder = wait_for_child(recorder, "recorder CLI after control stop")?;
+    assert_success(&recorder, "recorder CLI after control stop");
+    assert!(String::from_utf8_lossy(&recorder.stdout).contains("\"stop_reason\": \"ControlStop\""));
+
+    Ok(())
+}
+
+#[test]
+fn replay_cli_publish_subscribe_replays_archive_to_service()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    create_archive(&storage_path, &metadata_path)?;
+
+    let target_service = unique_service_name("LogArchiveCli/Replay/Target");
+    let target_node = NodeBuilder::new().create::<ipc::Service>()?;
+    let (payload_type, user_header_type) = byte_slice_service_details(2);
+    let target_pubsub = unsafe {
+        target_node
+            .service_builder(&ServiceName::new(&target_service)?)
+            .publish_subscribe::<[CustomPayloadMarker]>()
+            .user_header::<CustomHeaderMarker>()
+            .__internal_set_payload_type_details(&payload_type)
+            .__internal_set_user_header_type_details(&user_header_type)
+            .open_or_create()
+    }?;
+    let subscriber = target_pubsub.subscriber_builder().create()?;
+    thread::sleep(Duration::from_millis(50));
+
+    let replay = Command::new(env!("CARGO_BIN_EXE_iox2-log-replay"))
+        .args([
+            "--format",
+            "JSON",
+            "replay",
+            "--storage-path",
+            storage_path.to_str().expect("utf-8 storage path"),
+            "--metadata-log-path",
+            metadata_path.to_str().expect("utf-8 metadata path"),
+            "--to",
+            "publish-subscribe",
+            "--service",
+            &target_service,
+            "--rate",
+            "fixed",
+            "--messages-per-sec",
+            "2",
+            "--node-name",
+            "iox2-log-archive-cli-replay-pubsub",
+            "range",
+            "--from",
+            "1",
+            "--count",
+            "3",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let payload = receive_payload(&subscriber);
+    let replay = wait_for_child(replay, "replay publish-subscribe")?;
+    assert_success(&replay, "replay publish-subscribe");
+    assert!(
+        String::from_utf8_lossy(&replay.stdout).contains("\"destination\": \"publish-subscribe\"")
+    );
+    assert!(String::from_utf8_lossy(&replay.stdout).contains("\"emitted\": 3"));
+
+    let first_byte = *payload.first().expect("non-empty replay payload");
+    assert!((1..=3).contains(&first_byte));
+    assert_eq!(payload.len(), first_byte as usize + 4);
+    assert!(payload.iter().all(|byte| *byte == first_byte));
 
     Ok(())
 }
