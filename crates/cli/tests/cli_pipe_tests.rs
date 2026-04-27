@@ -1942,6 +1942,8 @@ fn replay_commands_cover_error_modes_and_rate_validation() -> Result<(), Box<dyn
     create_archive(&storage_path, &metadata_path)?;
 
     let replay_bin = env!("CARGO_BIN_EXE_iox2-log-replay");
+    let db_path = temp.path().join("replay-query.sqlite");
+    index_archive(&metadata_path, &db_path, "replay")?;
     let mut base = vec![
         "--format".to_string(),
         "JSON".to_string(),
@@ -1973,6 +1975,60 @@ fn replay_commands_cover_error_modes_and_rate_validation() -> Result<(), Box<dyn
     assert_success(&output, "replay skip missing sequence");
     assert!(String::from_utf8_lossy(&output.stderr).contains("\"skipped_missing\": 1"));
 
+    let mut partial_range_skip_args = base.clone();
+    partial_range_skip_args.push("--skip-missing".to_string());
+    partial_range_skip_args.extend(["range".to_string(), "--from".to_string(), "3".to_string()]);
+    partial_range_skip_args.extend(["--count".to_string(), "5".to_string()]);
+    let output = Command::new(replay_bin)
+        .args(partial_range_skip_args)
+        .output()?;
+    assert_success(&output, "replay partial range with skip-missing");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 2);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"skipped_missing\": 3"));
+
+    let mut partial_range_tolerated_args = base.clone();
+    partial_range_tolerated_args.extend(["--max-errors".to_string(), "10".to_string()]);
+    partial_range_tolerated_args.extend([
+        "range".to_string(),
+        "--from".to_string(),
+        "3".to_string(),
+    ]);
+    partial_range_tolerated_args.extend(["--count".to_string(), "5".to_string()]);
+    let output = Command::new(replay_bin)
+        .args(partial_range_tolerated_args)
+        .output()?;
+    assert_success(&output, "replay partial range below max errors");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 2);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"errors\": 3"));
+
+    let locator = first_locator_from_range(&db_path, "replay")?;
+    let locator_text = format!(
+        "{}:{}:{}:{}",
+        locator["segment_id"].as_u64().unwrap(),
+        locator["segment_generation"].as_u64().unwrap(),
+        locator["file_offset"].as_u64().unwrap(),
+        locator["frame_len"].as_u64().unwrap()
+    );
+    let mut locator_args = base.clone();
+    locator_args.extend(["locator".to_string(), "--at".to_string(), locator_text]);
+    let output = Command::new(replay_bin).args(locator_args).output()?;
+    assert_success(&output, "replay locator");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
+
+    let mut missing_locator_skip_args = base.clone();
+    missing_locator_skip_args.push("--skip-missing".to_string());
+    missing_locator_skip_args.extend([
+        "locator".to_string(),
+        "--at".to_string(),
+        "999:1:0:64".to_string(),
+    ]);
+    let output = Command::new(replay_bin)
+        .args(missing_locator_skip_args)
+        .output()?;
+    assert_success(&output, "replay missing locator with skip-missing");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 0);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"skipped_missing\": 1"));
+
     for (args, expected, context) in [
         {
             let mut args = base.clone();
@@ -1997,6 +2053,38 @@ fn replay_commands_cover_error_modes_and_rate_validation() -> Result<(), Box<dyn
         },
         {
             let mut args = base.clone();
+            args.extend(["--rate".to_string(), "fixed".to_string()]);
+            args.extend(["--messages-per-sec".to_string(), "0".to_string()]);
+            args.extend(["sequence".to_string(), "--at".to_string(), "1".to_string()]);
+            (
+                args,
+                "--messages-per-sec must be > 0",
+                "replay fixed rate zero messages_per_sec",
+            )
+        },
+        {
+            let mut args = base.clone();
+            args.extend(["--rate".to_string(), "fast".to_string()]);
+            args.extend(["--messages-per-sec".to_string(), "1".to_string()]);
+            args.extend(["sequence".to_string(), "--at".to_string(), "1".to_string()]);
+            (
+                args,
+                "--messages-per-sec is only valid when --rate=fixed",
+                "replay fast rate messages_per_sec",
+            )
+        },
+        {
+            let mut args = base.clone();
+            args.extend(["--node-name".to_string(), " ".to_string()]);
+            args.extend(["sequence".to_string(), "--at".to_string(), "1".to_string()]);
+            (
+                args,
+                "--node-name must not be empty",
+                "replay empty node name",
+            )
+        },
+        {
+            let mut args = base.clone();
             args.extend(["--max-errors".to_string(), "0".to_string()]);
             args.extend(["sequence".to_string(), "--at".to_string(), "99".to_string()]);
             (args, "--max-errors must be > 0", "replay zero max errors")
@@ -2012,6 +2100,37 @@ fn replay_commands_cover_error_modes_and_rate_validation() -> Result<(), Box<dyn
             )
         },
         {
+            let mut args = vec![
+                "--format".to_string(),
+                "JSON".to_string(),
+                "replay".to_string(),
+            ];
+            args.extend(replay_archive_args(&storage_path, &metadata_path));
+            args.extend(["--to".to_string(), "publish-subscribe".to_string()]);
+            args.extend(["sequence".to_string(), "--at".to_string(), "1".to_string()]);
+            (
+                args,
+                "--service is required for --to=publish-subscribe",
+                "replay pubsub missing service",
+            )
+        },
+        {
+            let mut args = vec![
+                "--format".to_string(),
+                "JSON".to_string(),
+                "replay".to_string(),
+            ];
+            args.extend(replay_archive_args(&storage_path, &metadata_path));
+            args.extend(["--to".to_string(), "publish-subscribe".to_string()]);
+            args.extend(["--service".to_string(), " ".to_string()]);
+            args.extend(["sequence".to_string(), "--at".to_string(), "1".to_string()]);
+            (
+                args,
+                "--service must not be empty",
+                "replay pubsub empty service",
+            )
+        },
+        {
             let mut args = base.clone();
             args.extend(["sequence".to_string(), "--at".to_string(), "99".to_string()]);
             (
@@ -2024,6 +2143,67 @@ fn replay_commands_cover_error_modes_and_rate_validation() -> Result<(), Box<dyn
         let output = Command::new(replay_bin).args(&args).output()?;
         assert_failure_contains(&output, expected, context);
     }
+
+    let missing_archive = Command::new(replay_bin)
+        .args([
+            "--format",
+            "JSON",
+            "replay",
+            "--storage-path",
+            temp.path()
+                .join("missing-archive")
+                .to_str()
+                .expect("utf-8 path"),
+            "--to",
+            "stdout",
+            "all",
+        ])
+        .output()?;
+    assert_failure_contains(
+        &missing_archive,
+        "archive not found",
+        "replay missing archive",
+    );
+
+    let default_metadata = Command::new(replay_bin)
+        .args([
+            "--format",
+            "JSON",
+            "replay",
+            "--storage-path",
+            storage_path.to_str().expect("utf-8 storage path"),
+            "--to",
+            "stdout",
+            "all",
+        ])
+        .output()?;
+    assert_failure_contains(
+        &default_metadata,
+        "commit.idxlog not found",
+        "replay default metadata path missing commit log",
+    );
+
+    let colocated_path = temp.path().join("colocated");
+    create_archive(&colocated_path, &colocated_path)?;
+    let colocated = Command::new(replay_bin)
+        .args([
+            "--format",
+            "JSON",
+            "replay",
+            "--storage-path",
+            colocated_path.to_str().expect("utf-8 colocated path"),
+            "--to",
+            "stdout",
+            "sequence",
+            "--at",
+            "1",
+        ])
+        .output()?;
+    assert_success(&colocated, "replay with default colocated metadata path");
+    assert_eq!(
+        String::from_utf8_lossy(&colocated.stdout).lines().count(),
+        1
+    );
 
     Ok(())
 }
@@ -2162,11 +2342,29 @@ fn replay_selector_files_cover_csv_and_ndjson_validation() -> Result<(), Box<dyn
     base.extend(["--to".to_string(), "stdout".to_string()]);
 
     let csv_path = temp.path().join("selectors.csv");
+    let locator = first_locator_from_range(
+        &{
+            let db_path = temp.path().join("selector-query.sqlite");
+            index_archive(&metadata_path, &db_path, "selector")?;
+            db_path
+        },
+        "selector",
+    )?;
+    let locator_row = format!(
+        "locator,,,,{}, {},{},{}\n",
+        locator["segment_id"].as_u64().unwrap(),
+        locator["segment_generation"].as_u64().unwrap(),
+        locator["file_offset"].as_u64().unwrap(),
+        locator["frame_len"].as_u64().unwrap()
+    );
     std::fs::write(
         &csv_path,
-        "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\n\
-         sequence,1,,,,,,\n\
-         range,,2,2,,,,\n",
+        format!(
+            "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\n\
+             sequence,1,,,,,,\n\
+             range,,2,2,,,,\n\
+             {locator_row}"
+        ),
     )?;
     let mut csv_args = base.clone();
     csv_args.extend(["selectors".to_string(), "--file".to_string()]);
@@ -2174,7 +2372,7 @@ fn replay_selector_files_cover_csv_and_ndjson_validation() -> Result<(), Box<dyn
     csv_args.extend(["--selector-format".to_string(), "csv".to_string()]);
     let output = Command::new(replay_bin).args(csv_args).output()?;
     assert_success(&output, "replay csv selector file");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 3);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 4);
 
     let ndjson_path = temp.path().join("selectors.ndjson");
     std::fs::write(
@@ -2190,11 +2388,48 @@ fn replay_selector_files_cover_csv_and_ndjson_validation() -> Result<(), Box<dyn
     assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 2);
 
     for (contents, format, expected, context) in [
+        ("", "csv", "csv selector input is empty", "csv empty input"),
         (
             "{\"kind\":\"sequence\"}\n",
             "ndjson",
             "missing field 'sequence'",
             "ndjson missing sequence",
+        ),
+        (
+            "{\"kind\":\"range\",\"count\":1}\n",
+            "ndjson",
+            "missing field 'from'",
+            "ndjson missing range from",
+        ),
+        (
+            "{\"kind\":\"range\",\"from\":1}\n",
+            "ndjson",
+            "missing field 'count'",
+            "ndjson missing range count",
+        ),
+        (
+            "{\"kind\":\"locator\",\"segment_generation\":1,\"file_offset\":0,\"frame_len\":1}\n",
+            "ndjson",
+            "missing field 'segment_id'",
+            "ndjson missing locator segment",
+        ),
+        (
+            "{\"kind\":\"locator\",\"segment_id\":1,\"file_offset\":0,\"frame_len\":1}\n",
+            "ndjson",
+            "missing field 'segment_generation'",
+            "ndjson missing locator generation",
+        ),
+        (
+            "{\"kind\":\"locator\",\"segment_id\":1,\"segment_generation\":1,\"frame_len\":1}\n",
+            "ndjson",
+            "missing field 'file_offset'",
+            "ndjson missing locator offset",
+        ),
+        (
+            "{\"kind\":\"locator\",\"segment_id\":1,\"segment_generation\":1,\"file_offset\":0}\n",
+            "ndjson",
+            "missing field 'frame_len'",
+            "ndjson missing locator frame len",
         ),
         (
             "{\"kind\":\"range\",\"from\":1,\"count\":0}\n",
@@ -2225,6 +2460,36 @@ fn replay_selector_files_cover_csv_and_ndjson_validation() -> Result<(), Box<dyn
             "csv",
             "invalid u64 in field 'sequence'",
             "csv invalid sequence",
+        ),
+        (
+            "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\nsequence,,,,,,,\n",
+            "csv",
+            "missing field 'sequence'",
+            "csv missing sequence",
+        ),
+        (
+            "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\nrange,,1,abc,,,,\n",
+            "csv",
+            "invalid usize in field 'count'",
+            "csv invalid range count",
+        ),
+        (
+            "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\nlocator,,,,1,abc,0,64\n",
+            "csv",
+            "invalid u32 in field 'segment_generation'",
+            "csv invalid locator generation",
+        ),
+        (
+            "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\nlocator,,,,1,1,0,0\n",
+            "csv",
+            "invalid locator frame_len '0'",
+            "csv invalid locator frame length",
+        ),
+        (
+            "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\nsequence,1\n",
+            "csv",
+            "expected 8 columns, got 2",
+            "csv wrong column count",
         ),
         (
             "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\nrange,,1,0,,,,\n",

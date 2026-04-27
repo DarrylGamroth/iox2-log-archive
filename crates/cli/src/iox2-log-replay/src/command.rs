@@ -1201,3 +1201,261 @@ fn print_output_to_stderr<T: Serialize>(
     eprintln!("{output}");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn frame(sequence: u64, event_time_ns: u64) -> ReplayedFrame {
+        ReplayedFrame {
+            commit_ordinal: sequence,
+            sequence,
+            event_time_ns,
+            commit_time_ns: event_time_ns + 10,
+            user_header: vec![0xA0, sequence as u8],
+            payload: vec![sequence as u8; 4],
+            frame_checksum: 0,
+            locator: ArchiveLocator {
+                segment_id: 1,
+                segment_generation: 1,
+                file_offset: sequence * 64,
+                frame_len: 64,
+            },
+        }
+    }
+
+    fn replay_options(rate: ReplayRateMode) -> ReplayOptions {
+        ReplayOptions {
+            storage_path: PathBuf::from("archive"),
+            metadata_log_path: Some(PathBuf::from("metadata")),
+            to: ReplayDestination::Stdout,
+            service: None,
+            rate,
+            messages_per_sec: None,
+            max_recorded_gap_ms: 1,
+            node_name: "test-node".to_string(),
+            skip_missing: false,
+            max_errors: None,
+            selector: ReplaySelector::All,
+        }
+    }
+
+    #[test]
+    fn replay_errors_render_exit_codes_display_and_json_payloads() {
+        let invalid = LogReplayCommandError::InvalidInput("bad selector".to_string());
+        assert_eq!(invalid.exit_code(), 2);
+        assert_eq!(invalid.to_string(), "bad selector");
+        assert!(
+            invalid
+                .to_formatted_error(Format::Json)
+                .contains("\"InvalidInput\"")
+        );
+
+        let unavailable = LogReplayCommandError::NotAvailable("missing".to_string());
+        assert_eq!(unavailable.exit_code(), 3);
+        assert_eq!(unavailable.to_string(), "missing");
+        assert!(
+            unavailable
+                .to_formatted_error(Format::Json)
+                .contains("\"NotAvailable\"")
+        );
+
+        let internal = LogReplayCommandError::Internal(anyhow!("boom"));
+        assert_eq!(internal.exit_code(), 1);
+        assert_eq!(internal.to_string(), "boom");
+        assert!(
+            internal
+                .to_formatted_error(Format::Json)
+                .contains("\"Internal\"")
+        );
+    }
+
+    #[test]
+    fn replay_pacer_and_counters_cover_rate_and_missing_edges() {
+        let mut counters = ReplayCounters {
+            selected: 0,
+            emitted: 0,
+            skipped_missing: 0,
+            errors: 0,
+            bytes_emitted: 0,
+        };
+        counters.handle_missing(0, false, 1, "none").unwrap();
+        counters
+            .handle_missing(2, false, 3, "partial range")
+            .unwrap();
+        assert_eq!(counters.errors, 2);
+        assert!(
+            counters
+                .handle_missing(1, false, 3, "partial range")
+                .unwrap_err()
+                .to_string()
+                .contains("reached error limit")
+        );
+        counters.handle_missing(4, true, 1, "skip").unwrap();
+        assert_eq!(counters.skipped_missing, 4);
+
+        let mut fast = ReplayPacer::new(&replay_options(ReplayRateMode::Fast)).unwrap();
+        fast.pace(&frame(1, 100));
+
+        let mut recorded = ReplayPacer::new(&replay_options(ReplayRateMode::Recorded)).unwrap();
+        recorded.pace(&frame(1, 200));
+        recorded.pace(&frame(2, 200));
+        recorded.pace(&frame(3, 201));
+
+        let mut fixed_options = replay_options(ReplayRateMode::Fixed);
+        fixed_options.messages_per_sec = Some(1_000_000);
+        let mut fixed = ReplayPacer::new(&fixed_options).unwrap();
+        fixed.pace(&frame(1, 100));
+        fixed.pace(&frame(2, 200));
+    }
+
+    #[test]
+    fn replay_selector_and_locator_helpers_validate_inputs() {
+        let locator = parse_locator("1:2:3:4").unwrap();
+        assert_eq!(locator.segment_generation, 2);
+        assert_eq!(locator.frame_len, 4);
+        assert!(
+            parse_locator("bad")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid locator")
+        );
+        assert!(
+            parse_locator("1:2:3:4:5")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid locator")
+        );
+        assert!(
+            parse_locator("1:0:3:4")
+                .unwrap_err()
+                .to_string()
+                .contains("segment generation")
+        );
+        assert!(
+            parse_locator("1:1:3:0")
+                .unwrap_err()
+                .to_string()
+                .contains("frame_len")
+        );
+
+        assert!(parse_required_csv_u64("", 2, "sequence").is_err());
+        assert!(parse_required_csv_u64("abc", 2, "sequence").is_err());
+        assert!(parse_required_csv_u32("", 2, "segment_generation").is_err());
+        assert!(parse_required_csv_u32("abc", 2, "segment_generation").is_err());
+        assert!(parse_required_csv_usize("", 2, "count").is_err());
+        assert!(parse_required_csv_usize("abc", 2, "count").is_err());
+
+        let sequence = selector_from_ndjson_record(
+            NdjsonSelectorRecord {
+                kind: "sequence".to_string(),
+                sequence: Some(7),
+                from: None,
+                count: None,
+                segment_id: None,
+                segment_generation: None,
+                file_offset: None,
+                frame_len: None,
+            },
+            1,
+        )
+        .unwrap();
+        assert!(matches!(sequence, Selector::Sequence(7)));
+    }
+
+    #[test]
+    fn replay_destination_and_error_mappers_cover_non_cli_edges() {
+        let mut stdout_service = replay_options(ReplayRateMode::Fast);
+        stdout_service.service = Some("service".to_string());
+        let error = match ReplayEmitter::from_options(&stdout_service) {
+            Ok(_) => panic!("stdout emitter with service should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--service is only valid"));
+
+        let mut pubsub_missing = replay_options(ReplayRateMode::Fast);
+        pubsub_missing.to = ReplayDestination::PublishSubscribe;
+        assert!(
+            required_destination_service(&pubsub_missing)
+                .unwrap_err()
+                .to_string()
+                .contains("--service is required")
+        );
+        pubsub_missing.service = Some(" ".to_string());
+        assert!(
+            required_destination_service(&pubsub_missing)
+                .unwrap_err()
+                .to_string()
+                .contains("--service must not be empty")
+        );
+
+        assert!(matches!(
+            map_replay_error(ArchiveReplayError::MissingCommitLog(
+                Path::new("commit.idxlog").into()
+            )),
+            LogReplayCommandError::NotAvailable(_)
+        ));
+        assert!(matches!(
+            map_replay_error(ArchiveReplayError::InvalidConfiguration("bad config")),
+            LogReplayCommandError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            map_replay_error(ArchiveReplayError::InvalidPinState("bad pin")),
+            LogReplayCommandError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            map_rematerialize_error(ArchiveRematerializeError::InvalidConfiguration("bad remat")),
+            LogReplayCommandError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            map_rematerialize_error(ArchiveRematerializeError::Replay(
+                ArchiveReplayError::InvalidCommitEntry("bad commit")
+            )),
+            LogReplayCommandError::InvalidInput(_)
+        ));
+        assert!(
+            map_rematerialize_error(ArchiveRematerializeError::IncompatibleUserHeaderSize {
+                expected: 4,
+                actual: 2,
+                sequence: 9,
+            })
+            .to_string()
+            .contains("incompatible user header")
+        );
+    }
+
+    #[test]
+    fn replay_summary_labels_and_header_accounting_are_stable() {
+        assert_eq!(rate_mode_label(ReplayRateMode::Fast), "fast");
+        assert_eq!(rate_mode_label(ReplayRateMode::Recorded), "recorded");
+        assert_eq!(rate_mode_label(ReplayRateMode::Fixed), "fixed");
+        assert_eq!(bytes_to_hex(&[0x00, 0xAB, 0xFF]), "00abff");
+
+        assert_eq!(
+            selector_source_label(&ReplaySelector::Sequence(SequenceSelector { at: 1 })),
+            "sequence"
+        );
+        assert_eq!(
+            selector_source_label(&ReplaySelector::Range(RangeSelector { from: 1, count: 2 })),
+            "range"
+        );
+        assert_eq!(
+            selector_source_label(&ReplaySelector::Locator(LocatorSelector {
+                at: "1:1:0:64".to_string(),
+            })),
+            "locator"
+        );
+        assert_eq!(
+            selector_source_label(&ReplaySelector::Selectors(SelectorsSelector {
+                stdin: true,
+                file: None,
+                selector_format: SelectorFormat::Ndjson,
+            })),
+            "selectors:stdin:ndjson"
+        );
+
+        let frame = frame(1, 100);
+        assert_eq!(effective_user_header(&frame), &[0xA0, 0x01]);
+    }
+}
