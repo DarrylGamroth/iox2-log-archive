@@ -269,3 +269,110 @@ fn log_archive_rematerializer_reports_incompatible_user_header_size() {
         })
     ));
 }
+
+#[test]
+fn log_archive_rematerializer_reports_operational_configuration_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+
+    let mut recorder = ArchiveRecorderBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .segment_bytes(16 * 1024)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .persistence_mode(PersistenceMode::Async)
+        .checksum_mode(ChecksumMode::Crc32c)
+        .create()
+        .unwrap();
+    recorder
+        .append_publish_subscribe_record(PublishSubscribeRecordInput {
+            event_time_ns: 99,
+            source_service_id: 21,
+            source_publisher_id: 22,
+            source_sequence: Some(1),
+            user_header: &[0xAA, 0xBB],
+            payload: &[0x01, 0x02, 0x03],
+        })
+        .unwrap();
+    recorder.finalize().unwrap();
+
+    let replayer = ArchiveReplayerBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .open()
+        .unwrap();
+
+    for (builder, expected) in [
+        (
+            PubSubRematerializerBuilder::new(" "),
+            "service_name must not be empty",
+        ),
+        (
+            PubSubRematerializerBuilder::new("Archive/Rematerialize/BadNode").node_name(" "),
+            "node_name must not be empty",
+        ),
+        (
+            PubSubRematerializerBuilder::new("Archive/Rematerialize/BadAlignment")
+                .user_header_alignment(0),
+            "user_header_alignment must be > 0",
+        ),
+        (
+            PubSubRematerializerBuilder::new("Archive/Rematerialize/BadSlice")
+                .initial_max_slice_len(0),
+            "initial_max_slice_len must be > 0",
+        ),
+    ] {
+        let error = builder.create().unwrap_err();
+        assert!(matches!(
+            error,
+            ArchiveRematerializeError::InvalidConfiguration(message) if message == expected
+        ));
+    }
+
+    let token = unique_token();
+    let no_subscriber =
+        PubSubRematerializerBuilder::new(format!("Archive/Rematerialize/NoSubscriber/{token}"))
+            .node_name(format!("archive-remat-no-subscriber-{token}"))
+            .user_header_size(2)
+            .create()
+            .unwrap();
+    assert_eq!(
+        no_subscriber.rematerialize_sequence(&replayer, 1).unwrap(),
+        Some(0)
+    );
+
+    let filtered =
+        PubSubRematerializerBuilder::new(format!("Archive/Rematerialize/Filtered/{token}"))
+            .node_name(format!("archive-remat-filtered-{token}"))
+            .user_header_size(2)
+            .source_pattern_filter(Some(ArchiveSourcePattern::Log))
+            .create()
+            .unwrap();
+    assert_eq!(filtered.rematerialize_sequence(&replayer, 1).unwrap(), None);
+
+    let service_name = format!("Archive/Rematerialize/IncompatibleService/{token}");
+    let node = NodeBuilder::new()
+        .name(&NodeName::new(&format!("archive-remat-incompat-node-{token}")).unwrap())
+        .create::<ipc::Service>()
+        .unwrap();
+    let (payload_type, user_header_type) = type_details(2, "DifferentHeader");
+    let _service = unsafe {
+        node.service_builder(&ServiceName::new(&service_name).unwrap())
+            .publish_subscribe::<[CustomPayloadMarker]>()
+            .user_header::<CustomHeaderMarker>()
+            .__internal_set_payload_type_details(&payload_type)
+            .__internal_set_user_header_type_details(&user_header_type)
+            .open_or_create()
+    }
+    .unwrap();
+
+    let create_result = PubSubRematerializerBuilder::new(service_name)
+        .node_name(format!("archive-remat-incompat-publisher-{token}"))
+        .user_header_type_name("ExpectedHeader")
+        .user_header_size(2)
+        .create();
+    assert!(matches!(
+        create_result,
+        Err(ArchiveRematerializeError::ServiceCreation(_))
+    ));
+}

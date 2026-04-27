@@ -10,7 +10,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,12 +23,14 @@ use iceoryx2::prelude::*;
 use iceoryx2::service::builder::{CustomHeaderMarker, CustomPayloadMarker};
 use iceoryx2::service::static_config::message_type_details::{TypeDetail, TypeName, TypeVariant};
 use iox2_log_archive_core::log_archive::{
-    ArchiveLocator, ArchiveMetadataSink, ArchiveRecorderBuilder, ArchiveSourcePattern,
-    ChecksumMode, MetadataCommitRecord, PersistenceMode, PublishSubscribeRecordInput,
+    ARCHIVE_FILE_HEADER_V1_LEN, ArchiveLocator, ArchiveMetadataSink, ArchiveRecorderBuilder,
+    ArchiveSourcePattern, ChecksumMode, MetadataCommitRecord, PersistenceMode,
+    PublishSubscribeRecordInput,
 };
 use iox2_log_archive_sqlite::{SQLITE_SCHEMA_VERSION, SqliteIndexerState, SqliteMetadataSink};
 
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(1);
+const TEST_FRAME_OFFSET_MAGIC: u64 = 0;
 
 fn unique_service_name(prefix: &str) -> String {
     let suffix = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -42,6 +44,13 @@ fn assert_success(output: &Output, context: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn overwrite_bytes(path: &Path, offset: u64, bytes: &[u8]) {
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(bytes).unwrap();
+    file.flush().unwrap();
 }
 
 fn wait_for_child(mut child: Child, context: &str) -> Result<Output, Box<dyn std::error::Error>> {
@@ -1440,6 +1449,122 @@ fn replay_commands_cover_error_modes_and_rate_validation() -> Result<(), Box<dyn
         let output = Command::new(replay_bin).args(&args).output()?;
         assert_failure_contains(&output, expected, context);
     }
+
+    Ok(())
+}
+
+#[test]
+fn cli_commands_report_corrupted_archive_failures() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+
+    let corrupt_commit_storage = temp.path().join("corrupt-commit-archive");
+    let corrupt_commit_metadata = temp.path().join("corrupt-commit-metadata");
+    create_archive(&corrupt_commit_storage, &corrupt_commit_metadata)?;
+    overwrite_bytes(
+        &corrupt_commit_metadata.join("commit.idxlog"),
+        ARCHIVE_FILE_HEADER_V1_LEN as u64,
+        b"BAD!",
+    );
+
+    let replay_output = Command::new(env!("CARGO_BIN_EXE_iox2-log-replay"))
+        .args([
+            "--format",
+            "JSON",
+            "replay",
+            "--storage-path",
+            corrupt_commit_storage.to_str().expect("utf-8 storage path"),
+            "--metadata-log-path",
+            corrupt_commit_metadata
+                .to_str()
+                .expect("utf-8 metadata path"),
+            "--to",
+            "stdout",
+            "all",
+        ])
+        .output()?;
+    assert_failure_contains(
+        &replay_output,
+        "invalid commit entry magic",
+        "replay corrupt commit log",
+    );
+
+    let query_output = Command::new(env!("CARGO_BIN_EXE_iox2-log-query"))
+        .args([
+            "--format",
+            "JSON",
+            "index",
+            "catch-up",
+            "--stream-id",
+            "cam-corrupt",
+            "--metadata-log-path",
+            corrupt_commit_metadata
+                .to_str()
+                .expect("utf-8 metadata path"),
+            "--db-path",
+            temp.path()
+                .join("corrupt-query.sqlite")
+                .to_str()
+                .expect("utf-8 db path"),
+        ])
+        .output()?;
+    assert_failure_contains(
+        &query_output,
+        "invalid commit entry magic",
+        "query corrupt commit log",
+    );
+
+    let corrupt_frame_storage = temp.path().join("corrupt-frame-archive");
+    let corrupt_frame_metadata = temp.path().join("corrupt-frame-metadata");
+    let mut recorder = ArchiveRecorderBuilder::new(&corrupt_frame_storage)
+        .metadata_log_path(&corrupt_frame_metadata)
+        .segment_bytes(1024)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .persistence_mode(PersistenceMode::Async)
+        .checksum_mode(ChecksumMode::Crc32c)
+        .create()?;
+    let commit = recorder.append_publish_subscribe_record(PublishSubscribeRecordInput {
+        event_time_ns: 1_000,
+        source_service_id: 1,
+        source_publisher_id: 1,
+        source_sequence: Some(1),
+        user_header: &[0x01],
+        payload: &[0x02; 8],
+    })?;
+    recorder.finalize()?;
+    let segment_path = corrupt_frame_storage.join(format!(
+        "segments/segment-{}-g{}.data",
+        commit.locator.segment_id, commit.locator.segment_generation
+    ));
+    overwrite_bytes(
+        &segment_path,
+        commit.locator.file_offset + TEST_FRAME_OFFSET_MAGIC,
+        b"BAD!",
+    );
+
+    let replay_output = Command::new(env!("CARGO_BIN_EXE_iox2-log-replay"))
+        .args([
+            "--format",
+            "JSON",
+            "replay",
+            "--storage-path",
+            corrupt_frame_storage.to_str().expect("utf-8 storage path"),
+            "--metadata-log-path",
+            corrupt_frame_metadata
+                .to_str()
+                .expect("utf-8 metadata path"),
+            "--to",
+            "stdout",
+            "sequence",
+            "--at",
+            "1",
+        ])
+        .output()?;
+    assert_failure_contains(
+        &replay_output,
+        "InvalidFrameMagic",
+        "replay corrupt frame header",
+    );
 
     Ok(())
 }

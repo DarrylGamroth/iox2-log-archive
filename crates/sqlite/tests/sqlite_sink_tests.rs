@@ -246,6 +246,47 @@ fn sqlite_queries_reject_values_outside_sqlite_integer_range() {
 }
 
 #[test]
+fn sqlite_sink_reports_operational_open_and_write_failures() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let empty_stream = SqliteMetadataSink::open_for_stream(&temp.path().join("query.sqlite"), " ");
+    let empty_stream_error = empty_stream.unwrap_err();
+    assert!(
+        empty_stream_error
+            .details
+            .contains("stream_id must not be empty")
+    );
+
+    let missing_parent_path = temp.path().join("missing-parent/query.sqlite");
+    let open_error = SqliteMetadataSink::open(&missing_parent_path).unwrap_err();
+    assert!(open_error.details.contains("open sqlite connection failed"));
+
+    let db_path = temp.path().join("overflow.sqlite");
+    let mut sink = SqliteMetadataSink::open_for_stream(&db_path, "Cam/A").unwrap();
+    let mut overflowing_record = metadata_record(1, 1);
+    overflowing_record.sequence = (i64::MAX as u64) + 1;
+    let write_error = sink.on_records(&[overflowing_record]).unwrap_err();
+    assert!(write_error.details.contains("sequence"));
+
+    let mismatched_state = SqliteIndexerState {
+        stream_id: "Cam/B".to_string(),
+        log_id: [0x11; 16],
+        last_commit_ordinal: 1,
+        last_indexed_commit_ordinal: 1,
+        roll_file: "commit.idxlog".to_string(),
+        byte_offset: 0,
+        updated_at_ns: 0,
+        schema_version: SQLITE_SCHEMA_VERSION,
+    };
+    let state_error = sink.upsert_indexer_state(&mismatched_state).unwrap_err();
+    assert!(
+        state_error
+            .details
+            .contains("indexer state stream_id does not match")
+    );
+}
+
+#[test]
 fn sqlite_sink_rejects_malformed_log_id_blobs() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("query.sqlite");
@@ -280,6 +321,105 @@ fn sqlite_sink_rejects_malformed_log_id_blobs() {
 
     let error = sink.query_by_sequence(1).unwrap_err();
     assert!(error.details.contains("invalid records.log_id length"));
+}
+
+#[test]
+fn sqlite_sink_reports_malformed_record_and_state_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("malformed-values.sqlite");
+
+    let sink = SqliteMetadataSink::open_for_stream(&db_path, "Cam/A").unwrap();
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+
+    connection
+        .execute(
+            "INSERT INTO records
+            (stream_id, commit_ordinal, log_id, sequence, segment_id, segment_generation, file_offset, frame_len, frame_checksum, event_time_ns, commit_time_ns, source_pattern, source_service_id, source_instance_id, source_sequence)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                "Cam/A",
+                1i64,
+                vec![0xAAu8; 16],
+                1i64,
+                1i64,
+                1i64,
+                0i64,
+                64i64,
+                0i64,
+                0i64,
+                0i64,
+                99i64,
+                0i64,
+                0i64,
+                Option::<i64>::None,
+            ],
+        )
+        .unwrap();
+
+    let source_pattern_error = sink.query_by_sequence(1).unwrap_err();
+    assert!(
+        source_pattern_error
+            .details
+            .contains("unknown source pattern discriminator")
+    );
+
+    connection.execute("DELETE FROM records", []).unwrap();
+    connection
+        .execute(
+            "INSERT INTO records
+            (stream_id, commit_ordinal, log_id, sequence, segment_id, segment_generation, file_offset, frame_len, frame_checksum, event_time_ns, commit_time_ns, source_pattern, source_service_id, source_instance_id, source_sequence)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                "Cam/A",
+                -1i64,
+                vec![0xAAu8; 16],
+                2i64,
+                1i64,
+                1i64,
+                0i64,
+                64i64,
+                0i64,
+                0i64,
+                0i64,
+                1i64,
+                0i64,
+                0i64,
+                Option::<i64>::None,
+            ],
+        )
+        .unwrap();
+
+    let negative_commit_error = sink.query_by_sequence(2).unwrap_err();
+    assert!(
+        negative_commit_error
+            .details
+            .contains("negative sqlite value for commit_ordinal")
+    );
+
+    connection
+        .execute(
+            "INSERT INTO indexer_state
+            (stream_id, log_id, last_commit_ordinal, last_indexed_commit_ordinal, roll_file, byte_offset, updated_at_ns, schema_version)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                "Cam/A",
+                vec![0xBBu8; 4],
+                1i64,
+                1i64,
+                "commit.idxlog",
+                0i64,
+                0i64,
+                SQLITE_SCHEMA_VERSION as i64,
+            ],
+        )
+        .unwrap();
+
+    let state_error = sink.load_indexer_state().unwrap_err();
+    assert!(
+        state_error
+            .details
+            .contains("invalid indexer_state.log_id length")
+    );
 }
 
 #[test]

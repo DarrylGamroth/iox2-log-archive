@@ -11,6 +11,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,9 @@ use iox2_log_archive_core::log_archive::{PersistenceMode, RecorderProfile};
 use iox2_log_archive_iceoryx2::{
     LOG_RECORDER_CONTROL_CMD_FLUSH, LOG_RECORDER_CONTROL_CMD_PAUSE,
     LOG_RECORDER_CONTROL_CMD_RESUME, LOG_RECORDER_CONTROL_CMD_STATUS,
-    LOG_RECORDER_CONTROL_CMD_STOP, LOG_RECORDER_CONTROL_NONE, LogRecorderControlClientConfig,
+    LOG_RECORDER_CONTROL_CMD_STOP, LOG_RECORDER_CONTROL_NONE,
+    LOG_RECORDER_CONTROL_PROTOCOL_VERSION, LOG_RECORDER_CONTROL_STATE_RUNNING,
+    LOG_RECORDER_CONTROL_STATUS_INTERNAL_ERROR, LogRecorderControlClientConfig,
     LogRecorderControlError, LogRecorderControlRequest, LogRecorderControlResponse,
     PubSubRecorderConfig, PubSubRecorderStopReason, decode_optional_u64, encode_optional_u64,
     log_recorder_control_service_name, record_publish_subscribe, request_recorder_control,
@@ -250,8 +253,123 @@ fn control_protocol_helpers_and_config_errors_are_stable() {
     }
 }
 
+#[test]
+fn control_client_reports_malformed_daemon_responses() {
+    let service = unique_service_name("LogArchiveAdapter/FakeControl");
+
+    let mut wrong_protocol = LogRecorderControlResponse::ok(
+        LOG_RECORDER_CONTROL_STATE_RUNNING,
+        0,
+        0,
+        0,
+        0,
+        LOG_RECORDER_CONTROL_NONE,
+        LOG_RECORDER_CONTROL_NONE,
+        0,
+        LOG_RECORDER_CONTROL_NONE,
+    );
+    wrong_protocol.protocol_version = LOG_RECORDER_CONTROL_PROTOCOL_VERSION - 1;
+    let error = fake_control_response(&format!("{service}/Protocol"), wrong_protocol).unwrap_err();
+    assert!(matches!(error, LogRecorderControlError::NotAvailable(_)));
+    assert!(error.to_string().contains("protocol version mismatch"));
+
+    let error = fake_control_response(
+        &format!("{service}/Internal"),
+        LogRecorderControlResponse::error(LOG_RECORDER_CONTROL_STATUS_INTERNAL_ERROR),
+    )
+    .unwrap_err();
+    assert!(matches!(error, LogRecorderControlError::NotAvailable(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("daemon failed to execute command")
+    );
+
+    let error = fake_control_response(
+        &format!("{service}/Status"),
+        LogRecorderControlResponse::error(99),
+    )
+    .unwrap_err();
+    assert!(matches!(error, LogRecorderControlError::Iceoryx2(_)));
+    assert!(error.to_string().contains("unknown status code 99"));
+
+    let error = fake_control_response(
+        &format!("{service}/State"),
+        LogRecorderControlResponse::ok(
+            99,
+            0,
+            0,
+            0,
+            0,
+            LOG_RECORDER_CONTROL_NONE,
+            LOG_RECORDER_CONTROL_NONE,
+            0,
+            LOG_RECORDER_CONTROL_NONE,
+        ),
+    )
+    .unwrap_err();
+    assert!(matches!(error, LogRecorderControlError::Iceoryx2(_)));
+    assert!(error.to_string().contains("unknown state code 99"));
+}
+
 fn wait_for_control_status(service: &str) -> iox2_log_archive_iceoryx2::LogRecorderControlResult {
     wait_until(service, |_| true)
+}
+
+fn fake_control_response(
+    service: &str,
+    response: LogRecorderControlResponse,
+) -> Result<iox2_log_archive_iceoryx2::LogRecorderControlResult, LogRecorderControlError> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let service = service.to_string();
+    let server_service = service.clone();
+    let server_node_name = format!(
+        "iox2-log-archive-fake-control-server-{}",
+        UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let handle = thread::spawn(move || {
+        let node = NodeBuilder::new()
+            .name(&NodeName::new(&server_node_name).unwrap())
+            .create::<ipc::Service>()
+            .unwrap();
+        let control_service = log_recorder_control_service_name(&server_service);
+        let request_response = node
+            .service_builder(&ServiceName::new(&control_service).unwrap())
+            .request_response::<LogRecorderControlRequest, LogRecorderControlResponse>()
+            .open_or_create()
+            .unwrap();
+        let server = request_response.server_builder().create().unwrap();
+        ready_tx.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while let Some(active_request) = server.receive().unwrap() {
+                let _request = *active_request;
+                let _ = active_request.send_copy(response);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for fake control request"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let result = request_recorder_control(
+        LogRecorderControlClientConfig {
+            service,
+            node_name: format!(
+                "iox2-log-archive-fake-control-client-{}",
+                UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ),
+            timeout: Duration::from_secs(2),
+        },
+        LOG_RECORDER_CONTROL_CMD_STATUS,
+    );
+    handle.join().unwrap();
+    result
 }
 
 fn wait_until(

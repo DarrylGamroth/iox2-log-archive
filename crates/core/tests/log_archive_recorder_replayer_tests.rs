@@ -19,14 +19,21 @@ use std::time::Duration;
 
 use iceoryx2_bb_testing::assert_that;
 use iox2_log_archive_core::log_archive::{
-    ARCHIVE_FILE_HEADER_V1_LEN, ArchiveFileHeaderV1, ArchiveFileKind, ArchiveRecorderBuilder,
-    ArchiveRecorderError, ArchiveReplayError, ArchiveReplayerBuilder, ArchiveSegmentTier,
-    ArchiveSourcePattern, AsyncIoBackend, ChecksumMode, DEFAULT_ACK_POLL_INTERVAL,
-    DEFAULT_WAIT_DURABLE_DATA_AND_COMMIT_LOG_TIMEOUT, DEFAULT_WAIT_DURABLE_DATA_TIMEOUT,
-    EffectiveAsyncIoBackend, PersistenceMode, PublishSubscribeExternalPayloadInput,
-    PublishSubscribeRecordInput, RecorderAckLevel, ReplayBudget, ReplayFrameBuffer,
-    decode_adapter_user_header,
+    ARCHIVE_FILE_HEADER_V1_LEN, ArchiveFileHeaderV1, ArchiveFileKind, ArchiveLocator,
+    ArchiveRecorderBuilder, ArchiveRecorderError, ArchiveReplayError, ArchiveReplayerBuilder,
+    ArchiveSegmentTier, ArchiveSourcePattern, AsyncIoBackend, ChecksumMode,
+    DEFAULT_ACK_POLL_INTERVAL, DEFAULT_WAIT_DURABLE_DATA_AND_COMMIT_LOG_TIMEOUT,
+    DEFAULT_WAIT_DURABLE_DATA_TIMEOUT, EffectiveAsyncIoBackend, PersistenceMode,
+    PublishSubscribeExternalPayloadInput, PublishSubscribeRecordInput, RecorderAckLevel,
+    ReplayBudget, ReplayFrameBuffer, decode_adapter_user_header,
 };
+
+const TEST_FRAME_HEADER_LEN: usize = 64;
+const TEST_FRAME_OFFSET_MAGIC: u64 = 0;
+const TEST_FRAME_OFFSET_HEADER_LEN: u64 = 4;
+const TEST_FRAME_OFFSET_PAYLOAD_LEN: u64 = 52;
+const TEST_COMMIT_ENTRY_LEN: u64 = 104;
+const TEST_COMMIT_OFFSET_SEQUENCE: u64 = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct LogRecordInput<'a> {
@@ -114,6 +121,20 @@ fn different_log_id(log_id: [u8; 16]) -> [u8; 16] {
     let mut value = log_id;
     value[0] ^= 0xFF;
     value
+}
+
+fn overwrite_bytes(path: &Path, offset: u64, bytes: &[u8]) {
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(bytes).unwrap();
+    file.flush().unwrap();
+}
+
+fn segment_path_for(storage_path: &Path, locator: ArchiveLocator) -> std::path::PathBuf {
+    storage_path.join(format!(
+        "segments/segment-{}-g{}.data",
+        locator.segment_id, locator.segment_generation
+    ))
 }
 
 #[test]
@@ -474,6 +495,173 @@ fn log_archive_replayer_detects_corrupted_payload_with_checksum() {
 }
 
 #[test]
+fn log_archive_replayer_reports_corrupted_frame_header_failures() {
+    for corruption in ["magic", "header_len", "payload_bounds"] {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_path = temp.path().join("archive");
+        let metadata_path = temp.path().join("metadata");
+
+        let mut recorder = ArchiveRecorderBuilder::new(&storage_path)
+            .metadata_log_path(&metadata_path)
+            .segment_bytes(1024)
+            .segment_preallocate(false)
+            .spare_preallocated_segments(0)
+            .persistence_mode(PersistenceMode::Async)
+            .checksum_mode(ChecksumMode::Crc32c)
+            .create()
+            .unwrap();
+        let commit = recorder
+            .append_log_record(LogRecordInput {
+                sequence: 1,
+                event_time_ns: 42,
+                user_header: &[0xAA, 0xBB],
+                payload: &[0xCC; 8],
+            })
+            .unwrap();
+        recorder.finalize().unwrap();
+
+        let segment_path = segment_path_for(&storage_path, commit.locator);
+        match corruption {
+            "magic" => overwrite_bytes(
+                &segment_path,
+                commit.locator.file_offset + TEST_FRAME_OFFSET_MAGIC,
+                b"BAD!",
+            ),
+            "header_len" => overwrite_bytes(
+                &segment_path,
+                commit.locator.file_offset + TEST_FRAME_OFFSET_HEADER_LEN,
+                &(TEST_FRAME_HEADER_LEN as u16 - 1).to_le_bytes(),
+            ),
+            "payload_bounds" => overwrite_bytes(
+                &segment_path,
+                commit.locator.file_offset + TEST_FRAME_OFFSET_PAYLOAD_LEN,
+                &u32::MAX.to_le_bytes(),
+            ),
+            _ => unreachable!(),
+        }
+
+        let replayer = ArchiveReplayerBuilder::new(&storage_path)
+            .metadata_log_path(&metadata_path)
+            .open()
+            .unwrap();
+        let result = replayer.read_at_sequence(1);
+        match corruption {
+            "magic" => assert_that!(
+                matches!(result, Err(ArchiveReplayError::InvalidFrameMagic(_))),
+                eq true
+            ),
+            "header_len" => assert_that!(
+                matches!(result, Err(ArchiveReplayError::InvalidFrameHeaderLength(_))),
+                eq true
+            ),
+            "payload_bounds" => assert_that!(
+                matches!(
+                    result,
+                    Err(ArchiveReplayError::InvalidCommitEntry(
+                        "frame user/payload lengths exceed frame bounds"
+                    ))
+                ),
+                eq true
+            ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn log_archive_replayer_reports_commit_log_corruption_failures() {
+    for corruption in [
+        "duplicate_sequence",
+        "non_zero_short_tail",
+        "non_zero_zero_tail",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_path = temp.path().join("archive");
+        let metadata_path = temp.path().join("metadata");
+
+        let mut recorder = ArchiveRecorderBuilder::new(&storage_path)
+            .metadata_log_path(&metadata_path)
+            .segment_bytes(2048)
+            .segment_preallocate(false)
+            .spare_preallocated_segments(0)
+            .persistence_mode(PersistenceMode::Async)
+            .checksum_mode(ChecksumMode::Crc32c)
+            .create()
+            .unwrap();
+        for sequence in 1..=2u64 {
+            recorder
+                .append_log_record(LogRecordInput {
+                    sequence,
+                    event_time_ns: sequence,
+                    user_header: &[0x10],
+                    payload: &[sequence as u8; 8],
+                })
+                .unwrap();
+        }
+        recorder.finalize().unwrap();
+
+        let commit_log_path = metadata_path.join("commit.idxlog");
+        match corruption {
+            "duplicate_sequence" => overwrite_bytes(
+                &commit_log_path,
+                ARCHIVE_FILE_HEADER_V1_LEN as u64
+                    + TEST_COMMIT_ENTRY_LEN
+                    + TEST_COMMIT_OFFSET_SEQUENCE,
+                &1u64.to_le_bytes(),
+            ),
+            "non_zero_short_tail" => {
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(&commit_log_path)
+                    .unwrap();
+                file.write_all(&[0xDE, 0xAD, 0xBE]).unwrap();
+                file.flush().unwrap();
+            }
+            "non_zero_zero_tail" => {
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(&commit_log_path)
+                    .unwrap();
+                file.write_all(&[0u8; TEST_COMMIT_ENTRY_LEN as usize])
+                    .unwrap();
+                file.write_all(&[0x01]).unwrap();
+                file.flush().unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let result = ArchiveReplayerBuilder::new(&storage_path)
+            .metadata_log_path(&metadata_path)
+            .open();
+        match corruption {
+            "duplicate_sequence" => assert_that!(
+                matches!(result, Err(ArchiveReplayError::DuplicateSequence(1))),
+                eq true
+            ),
+            "non_zero_short_tail" => assert_that!(
+                matches!(
+                    result,
+                    Err(ArchiveReplayError::InvalidCommitEntry(
+                        "commit.idxlog contains trailing non-zero bytes"
+                    ))
+                ),
+                eq true
+            ),
+            "non_zero_zero_tail" => assert_that!(
+                matches!(
+                    result,
+                    Err(ArchiveReplayError::InvalidCommitEntry(
+                        "commit.idxlog contains non-zero bytes after zero-tail marker"
+                    ))
+                ),
+                eq true
+            ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn log_archive_replayer_honors_replay_budget_limits() {
     let temp = tempfile::tempdir().unwrap();
     let storage_path = temp.path().join("archive");
@@ -828,6 +1016,104 @@ fn log_archive_recorder_supports_explicit_blocking_backend_selection() {
         })
         .unwrap();
     recorder.finalize().unwrap();
+}
+
+#[test]
+fn log_archive_recorder_reports_operational_append_failures() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let existing_storage = temp.path().join("existing-archive");
+    let mut existing = ArchiveRecorderBuilder::new(&existing_storage)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .create()
+        .unwrap();
+    existing.finalize().unwrap();
+    let duplicate_create = ArchiveRecorderBuilder::new(&existing_storage).create();
+    assert_that!(
+        matches!(
+            duplicate_create,
+            Err(ArchiveRecorderError::ArchiveAlreadyExists(_))
+        ),
+        eq true
+    );
+
+    let frame_too_large_storage = temp.path().join("frame-too-large");
+    let mut frame_too_large = ArchiveRecorderBuilder::new(&frame_too_large_storage)
+        .segment_bytes(256)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .create()
+        .unwrap();
+    let result = frame_too_large.append_log_record(LogRecordInput {
+        sequence: 1,
+        event_time_ns: 1,
+        user_header: &[0xAA; 16],
+        payload: &[0xBB; 512],
+    });
+    assert_that!(
+        matches!(result, Err(ArchiveRecorderError::FrameTooLarge { .. })),
+        eq true
+    );
+
+    let sequence_storage = temp.path().join("sequence-and-finalized");
+    let mut sequence_recorder = ArchiveRecorderBuilder::new(&sequence_storage)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .create()
+        .unwrap();
+    sequence_recorder
+        .append_log_record(LogRecordInput {
+            sequence: 10,
+            event_time_ns: 10,
+            user_header: &[0x01],
+            payload: &[0x02; 8],
+        })
+        .unwrap();
+    sequence_recorder.finalize().unwrap();
+    let after_finalize = sequence_recorder.append_log_record(LogRecordInput {
+        sequence: 10,
+        event_time_ns: 12,
+        user_header: &[0x01],
+        payload: &[0x04; 8],
+    });
+    assert_that!(
+        matches!(after_finalize, Err(ArchiveRecorderError::Finalized)),
+        eq true
+    );
+
+    let capped_storage = temp.path().join("metadata-cap");
+    let capped_metadata = temp.path().join("metadata-cap-meta");
+    let metadata_min_bytes = ARCHIVE_FILE_HEADER_V1_LEN as u64 + TEST_COMMIT_ENTRY_LEN;
+    let mut capped = ArchiveRecorderBuilder::new(&capped_storage)
+        .metadata_log_path(&capped_metadata)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .metadata_log_roll_bytes(metadata_min_bytes)
+        .metadata_log_max_bytes(metadata_min_bytes)
+        .create()
+        .unwrap();
+    capped
+        .append_log_record(LogRecordInput {
+            sequence: 1,
+            event_time_ns: 1,
+            user_header: &[0x01],
+            payload: &[0x02; 8],
+        })
+        .unwrap();
+    let capped_result = capped.append_log_record(LogRecordInput {
+        sequence: 2,
+        event_time_ns: 2,
+        user_header: &[0x01],
+        payload: &[0x03; 8],
+    });
+    assert_that!(
+        matches!(
+            capped_result,
+            Err(ArchiveRecorderError::MetadataLogCapacityExceeded { .. })
+        ),
+        eq true
+    );
 }
 
 #[test]
@@ -1668,6 +1954,69 @@ fn log_archive_trim_respects_replay_snapshot_pins() {
     let trimmed_after_release = recorder.trim_before_sequence(u64::MAX).unwrap();
     assert_that!(trimmed_after_release > 0, eq true);
     assert_that!(recorder.list_segments().unwrap().is_empty(), eq true);
+}
+
+#[test]
+fn log_archive_replayer_reports_invalid_pin_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let empty_storage_path = temp.path().join("empty-archive");
+    let empty_metadata_path = temp.path().join("empty-metadata");
+
+    let mut empty_recorder = ArchiveRecorderBuilder::new(&empty_storage_path)
+        .metadata_log_path(&empty_metadata_path)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .create()
+        .unwrap();
+    empty_recorder.finalize().unwrap();
+
+    let empty_replayer = ArchiveReplayerBuilder::new(&empty_storage_path)
+        .metadata_log_path(&empty_metadata_path)
+        .open()
+        .unwrap();
+    let empty_snapshot = empty_replayer.begin_snapshot();
+    assert_that!(
+        matches!(
+            empty_snapshot,
+            Err(ArchiveReplayError::InvalidPinState(
+                "cannot create snapshot pin for empty archive"
+            ))
+        ),
+        eq true
+    );
+
+    let storage_path = temp.path().join("pinned-archive");
+    let metadata_path = temp.path().join("pinned-metadata");
+    let mut recorder = ArchiveRecorderBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .segment_preallocate(false)
+        .spare_preallocated_segments(0)
+        .create()
+        .unwrap();
+    recorder
+        .append_log_record(LogRecordInput {
+            sequence: 1,
+            event_time_ns: 1,
+            user_header: &[0x01],
+            payload: &[0x02; 8],
+        })
+        .unwrap();
+    recorder.finalize().unwrap();
+
+    let replayer = ArchiveReplayerBuilder::new(&storage_path)
+        .metadata_log_path(&metadata_path)
+        .open()
+        .unwrap();
+    let invalid_range = replayer.begin_pin(2, 1);
+    assert_that!(
+        matches!(
+            invalid_range,
+            Err(ArchiveReplayError::InvalidPinState(
+                "replay pin requires sequence_start <= sequence_end"
+            ))
+        ),
+        eq true
+    );
 }
 
 #[test]
