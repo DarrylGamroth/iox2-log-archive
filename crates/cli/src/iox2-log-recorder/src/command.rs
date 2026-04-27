@@ -560,4 +560,214 @@ mod tests {
         assert!(defaults.segment_preallocate);
         assert_eq!(defaults.subscriber_max_borrowed_samples, None);
     }
+
+    #[test]
+    fn profile_defaults_and_label_mappings_cover_all_cli_variants() {
+        assert_eq!(
+            persistence_mode_from_cli(
+                cli_profile_defaults(CliRecorderProfile::Durable).persistence_mode
+            ),
+            PersistenceMode::Sync
+        );
+        assert_eq!(
+            persistence_mode_from_cli(
+                cli_profile_defaults(CliRecorderProfile::Balanced).persistence_mode
+            ),
+            PersistenceMode::Async
+        );
+        assert_eq!(
+            persistence_mode_from_cli(
+                cli_profile_defaults(CliRecorderProfile::Replay).persistence_mode
+            ),
+            PersistenceMode::Async
+        );
+
+        for (cli, core, label) in [
+            (
+                CliRecorderProfile::Durable,
+                RecorderProfile::Durable,
+                "Durable",
+            ),
+            (
+                CliRecorderProfile::Balanced,
+                RecorderProfile::Balanced,
+                "Balanced",
+            ),
+            (
+                CliRecorderProfile::Throughput,
+                RecorderProfile::Throughput,
+                "Throughput",
+            ),
+            (
+                CliRecorderProfile::Replay,
+                RecorderProfile::Replay,
+                "Replay",
+            ),
+        ] {
+            assert_eq!(recorder_profile(cli), core);
+            assert_eq!(cli_recorder_profile_label(cli), label);
+        }
+
+        for (cli, core, label) in [
+            (
+                CliPersistenceMode::Volatile,
+                PersistenceMode::Volatile,
+                "Volatile",
+            ),
+            (CliPersistenceMode::Async, PersistenceMode::Async, "Async"),
+            (CliPersistenceMode::Sync, PersistenceMode::Sync, "Sync"),
+        ] {
+            assert_eq!(persistence_mode_from_cli(cli), core);
+            assert_eq!(persistence_mode_label(core), label);
+        }
+
+        for (cli, core, label) in [
+            (
+                CliRecorderAckLevel::Accepted,
+                RecorderAckLevel::Accepted,
+                "Accepted",
+            ),
+            (
+                CliRecorderAckLevel::DurableData,
+                RecorderAckLevel::DurableData,
+                "DurableData",
+            ),
+            (
+                CliRecorderAckLevel::DurableDataAndCommitLog,
+                RecorderAckLevel::DurableDataAndCommitLog,
+                "DurableDataAndCommitLog",
+            ),
+        ] {
+            assert_eq!(ack_level_from_cli(cli), core);
+            assert_eq!(ack_level_label(core), label);
+        }
+    }
+
+    #[test]
+    fn backend_checksum_policy_and_stop_reason_labels_cover_all_variants() {
+        for (cli, core, label) in [
+            (
+                CliAsyncIoBackend::IoUringPreferred,
+                AsyncIoBackend::IoUringPreferred,
+                "IoUringPreferred",
+            ),
+            (
+                CliAsyncIoBackend::IoUringRequired,
+                AsyncIoBackend::IoUringRequired,
+                "IoUringRequired",
+            ),
+            (
+                CliAsyncIoBackend::Blocking,
+                AsyncIoBackend::Blocking,
+                "Blocking",
+            ),
+        ] {
+            assert_eq!(async_io_backend_from_cli(cli), core);
+            assert_eq!(async_backend_label(core), label);
+        }
+        assert_eq!(
+            effective_async_backend_label(EffectiveAsyncIoBackend::IoUring),
+            "IoUring"
+        );
+        assert_eq!(
+            effective_async_backend_label(EffectiveAsyncIoBackend::Blocking),
+            "Blocking"
+        );
+
+        assert_eq!(
+            checksum_mode_from_cli(CliChecksumMode::None),
+            ChecksumMode::None
+        );
+        assert_eq!(
+            checksum_mode_from_cli(CliChecksumMode::Crc32c),
+            ChecksumMode::Crc32c
+        );
+        assert_eq!(checksum_mode_label(ChecksumMode::None), "None");
+        assert_eq!(checksum_mode_label(ChecksumMode::Crc32c), "Crc32c");
+
+        assert_eq!(
+            out_of_space_policy_from_cli(CliOutOfSpacePolicy::FailWriter),
+            OutOfSpacePolicy::FailWriter
+        );
+        assert_eq!(
+            out_of_space_policy_label(OutOfSpacePolicy::FailWriter),
+            "FailWriter"
+        );
+
+        for (reason, label) in [
+            (PubSubRecorderStopReason::ControlStop, "ControlStop"),
+            (
+                PubSubRecorderStopReason::ShutdownRequested,
+                "ShutdownRequested",
+            ),
+            (PubSubRecorderStopReason::MaxMessages, "MaxMessages"),
+            (PubSubRecorderStopReason::Timeout, "Timeout"),
+            (PubSubRecorderStopReason::WaitInterrupted, "WaitInterrupted"),
+        ] {
+            assert_eq!(stop_reason_label(reason), label);
+        }
+    }
+
+    #[test]
+    fn command_errors_render_as_json_and_exit_codes_are_stable() {
+        let invalid = LogRecordCommandError::InvalidInput("bad input".to_string());
+        assert_eq!(invalid.exit_code(), 2);
+        assert!(
+            invalid
+                .to_formatted_error(Format::Json)
+                .contains("\"InvalidInput\"")
+        );
+
+        let unavailable = LogRecordCommandError::NotAvailable("missing".to_string());
+        assert_eq!(unavailable.exit_code(), 3);
+        assert!(
+            unavailable
+                .to_formatted_error(Format::Json)
+                .contains("\"NotAvailable\"")
+        );
+
+        let internal = LogRecordCommandError::Internal(anyhow!("boom"));
+        assert_eq!(internal.exit_code(), 1);
+        assert!(
+            internal
+                .to_formatted_error(Format::Json)
+                .contains("\"Internal\"")
+        );
+    }
+
+    #[test]
+    fn helper_functions_handle_zero_duration_and_path_defaults() {
+        assert_eq!(non_zero_duration(0), None);
+        assert_eq!(non_zero_duration(5), Some(Duration::from_millis(5)));
+
+        let options = LogRecordArchiveOptions {
+            service: "Test/Recorder".to_string(),
+            storage_path: PathBuf::from("/tmp/archive"),
+            metadata_log_path: None,
+            profile: CliRecorderProfile::Balanced,
+            mode: None,
+            segment_bytes: None,
+            spare_preallocated_segments: None,
+            segment_preallocate: None,
+            max_disk_bytes: None,
+            async_io_backend: None,
+            io_uring_queue_depth: None,
+            io_submit_batch_max: None,
+            io_cqe_batch_max: None,
+            io_uring_register_files: None,
+            checksum_mode: None,
+            out_of_space_policy: None,
+            metadata_log_roll_bytes: None,
+            metadata_log_max_bytes: None,
+        };
+
+        let paths = ArchivePaths::from_options(&options).unwrap();
+        assert_eq!(paths.service, "Test/Recorder");
+        assert_eq!(paths.metadata_log_path, PathBuf::from("/tmp/archive"));
+
+        let payload = path_payload(&paths);
+        assert_eq!(payload.service, "Test/Recorder");
+        assert_eq!(payload.storage_path, "/tmp/archive");
+        assert_eq!(payload.metadata_log_path, "/tmp/archive");
+    }
 }

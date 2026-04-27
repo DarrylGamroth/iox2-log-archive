@@ -1761,3 +1761,271 @@ fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     value.push(suffix);
     PathBuf::from(value)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iox2_log_archive_core::log_archive::ArchiveSourcePattern;
+
+    fn metadata_record(sequence: u64, event_time_ns: u64) -> MetadataCommitRecord {
+        MetadataCommitRecord {
+            log_id: [sequence as u8; 16],
+            commit_ordinal: sequence,
+            sequence,
+            locator: ArchiveLocator {
+                segment_id: 1,
+                segment_generation: 1,
+                file_offset: sequence * 128,
+                frame_len: 128,
+            },
+            frame_checksum: sequence as u32,
+            event_time_ns,
+            commit_time_ns: event_time_ns + 10,
+            source_pattern: ArchiveSourcePattern::PublishSubscribe,
+            source_service_id: 7,
+            source_instance_id: 8,
+            source_sequence: Some(sequence),
+        }
+    }
+
+    #[test]
+    fn query_errors_render_exit_codes_and_json_payloads() {
+        let invalid = LogQueryCommandError::InvalidInput("bad query".to_string());
+        assert_eq!(invalid.exit_code(), 2);
+        assert_eq!(invalid.to_string(), "bad query");
+        assert!(
+            invalid
+                .to_formatted_error(Format::Json)
+                .contains("\"InvalidInput\"")
+        );
+
+        let unavailable = LogQueryCommandError::NotAvailable("missing".to_string());
+        assert_eq!(unavailable.exit_code(), 3);
+        assert!(
+            unavailable
+                .to_formatted_error(Format::Json)
+                .contains("\"NotAvailable\"")
+        );
+
+        let not_indexed = LogQueryCommandError::NotIndexedYet {
+            message: "not caught up".to_string(),
+            requested_bound: Some("sequence=9".to_string()),
+            query_watermark: 4,
+            last_commit_ordinal: 8,
+        };
+        assert_eq!(not_indexed.exit_code(), 3);
+        let json = not_indexed.to_formatted_error(Format::Json);
+        assert!(json.contains("\"NotIndexedYet\""));
+        assert!(json.contains("\"requested_bound\": \"sequence=9\""));
+        assert!(json.contains("\"query_watermark\": 4"));
+
+        let busy = LogQueryCommandError::ResourceBusy("locked".to_string());
+        assert_eq!(busy.exit_code(), 3);
+        assert!(
+            busy.to_formatted_error(Format::Json)
+                .contains("\"ResourceBusy\"")
+        );
+
+        let internal = LogQueryCommandError::Internal(anyhow!("boom"));
+        assert_eq!(internal.exit_code(), 1);
+        assert!(
+            internal
+                .to_formatted_error(Format::Json)
+                .contains("\"Internal\"")
+        );
+    }
+
+    #[test]
+    fn query_input_helpers_validate_streams_locators_and_time_windows() {
+        validate_stream_id("Cam/A").unwrap();
+        assert!(
+            validate_stream_id("")
+                .unwrap_err()
+                .to_string()
+                .contains("--stream-id")
+        );
+
+        assert_eq!(
+            normalize_streams(&["A".to_string(), "A".to_string()]).unwrap(),
+            vec!["A"]
+        );
+        assert!(
+            normalize_streams(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("--streams must contain at least one stream id")
+        );
+
+        let locator = parse_locator("1:2:3:4").unwrap();
+        assert_eq!(locator.segment_id, 1);
+        assert_eq!(locator.segment_generation, 2);
+        assert_eq!(locator.file_offset, 3);
+        assert_eq!(locator.frame_len, 4);
+        assert!(
+            parse_locator("1:0:3:4")
+                .unwrap_err()
+                .to_string()
+                .contains("segment generation")
+        );
+        assert!(
+            parse_locator("bad")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid locator")
+        );
+
+        assert_eq!(
+            resolve_time_window(Some(10), Some(20), None, None).unwrap(),
+            (10, 20)
+        );
+        let utc = resolve_time_window(
+            None,
+            None,
+            Some("1970-01-01T00:00:00Z"),
+            Some("1970-01-01T00:00:01Z"),
+        )
+        .unwrap();
+        assert_eq!(utc, (0, 1_000_000_000));
+        assert!(
+            resolve_time_window(Some(20), Some(10), None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("start must be <= end")
+        );
+        assert!(
+            resolve_time_window(None, Some(10), None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("provide either")
+        );
+        assert!(
+            resolve_time_window(
+                None,
+                None,
+                Some("1969-12-31T23:59:59Z"),
+                Some("1970-01-01T00:00:00Z"),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("negative epoch")
+        );
+    }
+
+    #[test]
+    fn alignment_helpers_cover_anchor_grid_exact_nearest_and_missing_rows() {
+        let records = vec![
+            StampedRecord {
+                ts: 100,
+                record: metadata_record(1, 100),
+            },
+            StampedRecord {
+                ts: 300,
+                record: metadata_record(2, 300),
+            },
+        ];
+        let mut stream_data = BTreeMap::new();
+        stream_data.insert("A".to_string(), records);
+        stream_data.insert("B".to_string(), Vec::new());
+        let streams = vec!["A".to_string(), "B".to_string()];
+
+        let anchor = build_timeline(TimelineRequest {
+            stream_data: &stream_data,
+            streams: &streams,
+            mode: AlignMode::Anchor,
+            anchor_stream: Some("A"),
+            step_ns: None,
+            start_ns: 0,
+            end_ns: 500,
+            limit: 10,
+        })
+        .unwrap();
+        assert_eq!(anchor, vec![100, 300]);
+
+        let grid = build_timeline(TimelineRequest {
+            stream_data: &stream_data,
+            streams: &streams,
+            mode: AlignMode::Grid,
+            anchor_stream: None,
+            step_ns: Some(200),
+            start_ns: 100,
+            end_ns: 500,
+            limit: 10,
+        })
+        .unwrap();
+        assert_eq!(grid, vec![100, 300, 500]);
+
+        assert!(
+            build_timeline(TimelineRequest {
+                stream_data: &stream_data,
+                streams: &streams,
+                mode: AlignMode::Grid,
+                anchor_stream: None,
+                step_ns: Some(0),
+                start_ns: 0,
+                end_ns: 10,
+                limit: 10,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("--step-ns must be > 0")
+        );
+
+        let exact = find_match(&stream_data["A"], 100, FillPolicy::Drop, 0);
+        assert!(matches!(exact.status, MatchStatus::Exact));
+        assert_eq!(exact.delta_ns, Some(0));
+
+        let nearest = find_match(&stream_data["A"], 250, FillPolicy::Nearest, 75);
+        assert!(matches!(nearest.status, MatchStatus::Nearest));
+        assert_eq!(nearest.delta_ns, Some(50));
+
+        let missing = find_match(&stream_data["A"], 250, FillPolicy::Drop, 75);
+        assert!(matches!(missing.status, MatchStatus::Missing));
+
+        let context = AlignBuildContext {
+            streams: &streams,
+            stream_data: &stream_data,
+            fill_policy: FillPolicy::Null,
+            max_skew_ns: 0,
+            require_all_streams: false,
+            time_field: TimeField::Event,
+        };
+        let row = build_aligned_row(100, &context, true).unwrap();
+        assert_eq!(row.streams["A"].status, "exact");
+        assert_eq!(row.streams["A"].locator.unwrap().file_offset, 128);
+        assert!(row.streams["A"].provenance.is_some());
+        assert_eq!(row.streams["B"].status, "missing");
+
+        let selector_row = build_align_selector_row(100, &context).unwrap();
+        assert!(selector_row.streams["A"].is_some());
+        assert!(selector_row.streams["B"].is_none());
+
+        let drop_context = AlignBuildContext {
+            fill_policy: FillPolicy::Drop,
+            ..context
+        };
+        assert!(build_aligned_row(100, &drop_context, false).is_none());
+        assert!(build_align_selector_row(100, &drop_context).is_none());
+    }
+
+    #[test]
+    fn schema_helpers_report_missing_databases_and_sidecar_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("missing.sqlite");
+
+        let missing = ensure_existing_schema_compatibility(&db_path).unwrap_err();
+        assert!(missing.to_string().contains("query database not found"));
+
+        assert_eq!(
+            sqlite_sidecar_path(&db_path, "-wal"),
+            temp.path().join("missing.sqlite-wal")
+        );
+
+        std::fs::write(&db_path, b"not sqlite").unwrap();
+        std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
+        std::fs::write(sqlite_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
+        reset_index_db(&db_path).unwrap();
+        assert!(!db_path.exists());
+        assert!(!sqlite_sidecar_path(&db_path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&db_path, "-shm").exists());
+    }
+}

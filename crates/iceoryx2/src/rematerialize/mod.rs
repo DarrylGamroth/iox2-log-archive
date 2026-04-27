@@ -75,3 +75,31 @@ impl From<ArchiveReplayError> for ArchiveRematerializeError {
         Self::Replay(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rematerialize_error_display_includes_variant_context() {
+        let error = ArchiveRematerializeError::IncompatibleUserHeaderSize {
+            expected: 16,
+            actual: 8,
+            sequence: 42,
+        };
+
+        let text = error.to_string();
+        assert!(text.contains("ArchiveRematerializeError::IncompatibleUserHeaderSize"));
+        assert!(text.contains("expected: 16"));
+        assert!(text.contains("actual: 8"));
+        assert!(text.contains("sequence: 42"));
+    }
+
+    #[test]
+    fn replay_errors_convert_to_rematerialize_errors() {
+        let error: ArchiveRematerializeError =
+            ArchiveReplayError::InvalidConfiguration("bad replay config").into();
+
+        assert!(matches!(error, ArchiveRematerializeError::Replay(_)));
+        assert!(error.to_string().contains("Replay"));
+    }
+}

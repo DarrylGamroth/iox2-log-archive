@@ -303,6 +303,137 @@ fn recorder_rejects_zero_borrowed_sample_capacity() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn recorder_rejects_invalid_runtime_and_archive_options() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    let recorder_bin = env!("CARGO_BIN_EXE_iox2-log-recorder");
+    let storage = storage_path.to_str().expect("utf-8 storage path");
+    let metadata = metadata_path.to_str().expect("utf-8 metadata path");
+
+    for (args, expected, context) in [
+        (
+            vec![
+                "--format",
+                "JSON",
+                "publish-subscribe",
+                "--service",
+                "",
+                "--storage-path",
+                storage,
+                "--metadata-log-path",
+                metadata,
+                "--timeout-ms",
+                "1",
+            ],
+            "--service must not be empty",
+            "recorder empty service",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "publish-subscribe",
+                "--service",
+                "Test/Recorder/BadCycle",
+                "--storage-path",
+                storage,
+                "--metadata-log-path",
+                metadata,
+                "--cycle-time-ms",
+                "0",
+                "--timeout-ms",
+                "1",
+            ],
+            "--cycle-time-ms must be greater than 0",
+            "recorder zero cycle time",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "publish-subscribe",
+                "--service",
+                "Test/Recorder/BadSegment",
+                "--storage-path",
+                storage,
+                "--metadata-log-path",
+                metadata,
+                "--segment-bytes",
+                "0",
+                "--timeout-ms",
+                "1",
+            ],
+            "--segment-bytes must be greater than 0",
+            "recorder zero segment bytes",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "publish-subscribe",
+                "--service",
+                "Test/Recorder/BadQueueDepth",
+                "--storage-path",
+                storage,
+                "--metadata-log-path",
+                metadata,
+                "--io-uring-queue-depth",
+                "0",
+                "--timeout-ms",
+                "1",
+            ],
+            "--io-uring-queue-depth must be greater than 0",
+            "recorder zero io_uring queue depth",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "publish-subscribe",
+                "--service",
+                "Test/Recorder/BadSubmitBatch",
+                "--storage-path",
+                storage,
+                "--metadata-log-path",
+                metadata,
+                "--io-submit-batch-max",
+                "0",
+                "--timeout-ms",
+                "1",
+            ],
+            "--io-submit-batch-max must be greater than 0",
+            "recorder zero submit batch",
+        ),
+        (
+            vec![
+                "--format",
+                "JSON",
+                "publish-subscribe",
+                "--service",
+                "Test/Recorder/BadCqeBatch",
+                "--storage-path",
+                storage,
+                "--metadata-log-path",
+                metadata,
+                "--io-cqe-batch-max",
+                "0",
+                "--timeout-ms",
+                "1",
+            ],
+            "--io-cqe-batch-max must be greater than 0",
+            "recorder zero cqe batch",
+        ),
+    ] {
+        let output = Command::new(recorder_bin).args(args).output()?;
+        assert_failure_contains(&output, expected, context);
+    }
+
+    Ok(())
+}
+
+#[test]
 fn admin_commands_cover_archive_lifecycle_and_inspection() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp = tempfile::tempdir()?;
@@ -877,6 +1008,135 @@ fn replay_commands_cover_error_modes_and_rate_validation() -> Result<(), Box<dyn
         let output = Command::new(replay_bin).args(&args).output()?;
         assert_failure_contains(&output, expected, context);
     }
+
+    Ok(())
+}
+
+#[test]
+fn replay_selector_files_cover_csv_and_ndjson_validation() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let storage_path = temp.path().join("archive");
+    let metadata_path = temp.path().join("metadata");
+    create_archive(&storage_path, &metadata_path)?;
+
+    let replay_bin = env!("CARGO_BIN_EXE_iox2-log-replay");
+    let mut base = vec![
+        "--format".to_string(),
+        "JSON".to_string(),
+        "replay".to_string(),
+    ];
+    base.extend(replay_archive_args(&storage_path, &metadata_path));
+    base.extend(["--to".to_string(), "stdout".to_string()]);
+
+    let csv_path = temp.path().join("selectors.csv");
+    std::fs::write(
+        &csv_path,
+        "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\n\
+         sequence,1,,,,,,\n\
+         range,,2,2,,,,\n",
+    )?;
+    let mut csv_args = base.clone();
+    csv_args.extend(["selectors".to_string(), "--file".to_string()]);
+    csv_args.push(csv_path.to_str().expect("utf-8 csv path").to_string());
+    csv_args.extend(["--selector-format".to_string(), "csv".to_string()]);
+    let output = Command::new(replay_bin).args(csv_args).output()?;
+    assert_success(&output, "replay csv selector file");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 3);
+
+    let ndjson_path = temp.path().join("selectors.ndjson");
+    std::fs::write(
+        &ndjson_path,
+        "\n{\"kind\":\"sequence\",\"sequence\":1}\n{\"kind\":\"range\",\"from\":2,\"count\":1}\n",
+    )?;
+    let mut ndjson_args = base.clone();
+    ndjson_args.extend(["selectors".to_string(), "--file".to_string()]);
+    ndjson_args.push(ndjson_path.to_str().expect("utf-8 ndjson path").to_string());
+    ndjson_args.extend(["--selector-format".to_string(), "ndjson".to_string()]);
+    let output = Command::new(replay_bin).args(ndjson_args).output()?;
+    assert_success(&output, "replay ndjson selector file");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 2);
+
+    for (contents, format, expected, context) in [
+        (
+            "{\"kind\":\"sequence\"}\n",
+            "ndjson",
+            "missing field 'sequence'",
+            "ndjson missing sequence",
+        ),
+        (
+            "{\"kind\":\"range\",\"from\":1,\"count\":0}\n",
+            "ndjson",
+            "count must be > 0",
+            "ndjson zero range count",
+        ),
+        (
+            "{\"kind\":\"locator\",\"segment_id\":1,\"segment_generation\":0,\"file_offset\":0,\"frame_len\":1}\n",
+            "ndjson",
+            "invalid locator segment generation '0'",
+            "ndjson invalid locator generation",
+        ),
+        (
+            "{\"kind\":\"unknown\"}\n",
+            "ndjson",
+            "unsupported kind 'unknown'",
+            "ndjson unsupported kind",
+        ),
+        (
+            "kind,sequence\nsequence,1\n",
+            "csv",
+            "csv selector header is missing 'from'",
+            "csv missing header",
+        ),
+        (
+            "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\nsequence,abc,,,,,,\n",
+            "csv",
+            "invalid u64 in field 'sequence'",
+            "csv invalid sequence",
+        ),
+        (
+            "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\nrange,,1,0,,,,\n",
+            "csv",
+            "count must be > 0",
+            "csv zero range count",
+        ),
+        (
+            "kind,sequence,from,count,segment_id,segment_generation,file_offset,frame_len\nunknown,,,,,,,\n",
+            "csv",
+            "unsupported kind 'unknown'",
+            "csv unsupported kind",
+        ),
+    ] {
+        let selector_path = temp.path().join(format!("{context}.selectors"));
+        std::fs::write(&selector_path, contents)?;
+        let mut args = base.clone();
+        args.extend(["selectors".to_string(), "--file".to_string()]);
+        args.push(
+            selector_path
+                .to_str()
+                .expect("utf-8 selector path")
+                .to_string(),
+        );
+        args.extend(["--selector-format".to_string(), format.to_string()]);
+        let output = Command::new(replay_bin).args(args).output()?;
+        assert_failure_contains(&output, expected, context);
+    }
+
+    let missing_path = temp.path().join("does-not-exist.ndjson");
+    let mut args = base.clone();
+    args.extend(["selectors".to_string(), "--file".to_string()]);
+    args.push(
+        missing_path
+            .to_str()
+            .expect("utf-8 missing path")
+            .to_string(),
+    );
+    let output = Command::new(replay_bin).args(args).output()?;
+    assert_failure_contains(
+        &output,
+        "failed to open selector file",
+        "missing selector file",
+    );
 
     Ok(())
 }
