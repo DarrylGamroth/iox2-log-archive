@@ -6,8 +6,8 @@
 - Last updated: 2026-04-27
 
 ## Related Documents
-- Archive/replay plan: `docs/log-archive-v2.md`
-- Pub/sub V1 plan: `docs/log-archive-pubsub-v1-plan.md`
+- Archive/replay plan: `docs/design/log-archive-v2.md`
+- Pub/sub V1 plan: `docs/design/log-archive-pubsub-v1-plan.md`
 - Historical Log v1 pattern: `historical log-messaging-pattern design` (retired on `design/log-archive-pubsub-v1`)
 
 ## Scope
@@ -444,7 +444,7 @@ Recovery invariants:
 
 ## Planning and Tracking
 - Canonical implementation plan and progress tracking are maintained in:
-- `docs/log-archive-v2.md`
+- `docs/design/log-archive-v2.md`
 - This document is a companion contract/specification focused on metadata interfaces, file/schema formats, and operational invariants.
 - Metadata implementation work maps primarily to:
 - `log-archive-v2` Phase 5 (Metadata Integration and Tooling)

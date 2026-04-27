@@ -384,8 +384,9 @@ Both scripts emit JSON reports with host and storage metadata.
 - Archive maintenance/inspection is available via `iox2-log-admin`.
 - Dedicated C/C++/Python FFI for log-archive control is not implemented yet.
 
-## Design References
+## Reference Docs
 
-- `docs/log-archive-v2.md`
-- `docs/log-archive-pubsub-v1-plan.md`
 - `docs/cli-reference.md`
+- `docs/operator-guide.md`
+- `docs/release-readiness.md`
+- `docs/benchmark-baseline-2026-04-24.md`

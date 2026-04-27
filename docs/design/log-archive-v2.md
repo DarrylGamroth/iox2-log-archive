@@ -6,7 +6,7 @@
 - Last updated: 2026-04-27
 - Implementation progress: Phase 0 complete, Phase 1 complete, Phase 2 complete, Phase 3 complete, Phase 4 complete, Phase 5 complete, Phase 6 complete, Phase 7 complete, Phase 8 complete
 - Historical dependency: `historical log-messaging-pattern design` (retired on `design/log-archive-pubsub-v1`)
-- Metadata integration note: `docs/log-archive-userland-metadata.md`
+- Metadata integration note: `docs/design/log-archive-userland-metadata.md`
 - Traceability matrix: historical source document; not included in this extracted repository
 - Canonical plan/tracking document for archive implementation phases.
 

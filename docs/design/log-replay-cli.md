@@ -4,8 +4,8 @@
 - Implemented
 - Last updated: 2026-04-27
 - Target branch: `design/log-archive-userland`
-- Depends on: `docs/log-archive-v2.md`
-- Active scope note: narrowed by `docs/log-archive-pubsub-v1-plan.md`; Log rematerialization is retired on `design/log-archive-pubsub-v1`.
+- Depends on: `docs/design/log-archive-v2.md`
+- Active scope note: narrowed by `docs/design/log-archive-pubsub-v1-plan.md`; Log rematerialization is retired on `design/log-archive-pubsub-v1`.
 - Implementation progress: Phase 0 complete, Phase 1 complete, Phase 2 complete, Phase 3 complete, Phase 4 complete, Phase 5 complete.
 
 ## Scope

@@ -19,7 +19,8 @@ active scope.
 - `crates/iceoryx2`: iceoryx2 publish-subscribe integration adapters.
 - `crates/sqlite`: SQLite metadata indexing and query backend.
 - `crates/cli`: recorder, control, admin, query, and replay binaries.
-- `docs`: extracted design documents from the original fork branch.
+- `docs`: current CLI, operator, release, benchmark, and integration notes.
+- `docs/design`: historical planning/design documents kept out of the user-level docs path.
 
 ## Build
 
