@@ -393,6 +393,19 @@ submitted/completed write SQEs, wait calls, pending-write high-watermark, and
 average writes per submit. Use those counters to distinguish true async
 batching from a queue that has degraded into submit/wait-per-record behavior.
 
+Experimental completion-worker mode:
+
+```bash
+IOX2_LOG_ARCHIVE_IO_URING_COMPLETION_WORKER=1 \
+BACKEND=io_uring_required \
+crates/core/scripts/run_throughput_profile_benchmark.sh /tmp/log-archive-bench-cq-worker
+```
+
+This mode moves CQ waiting/reaping to a dedicated thread while the recorder
+thread owns submission and pending buffers. It is intentionally opt-in; current
+`spiders` measurements show mixed results and do not justify making it the
+default throughput path yet.
+
 ## Current Limits
 
 - Live recording is available via Rust API and `iox2-log-recorder`.

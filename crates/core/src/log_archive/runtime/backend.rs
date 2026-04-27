@@ -17,6 +17,10 @@ use std::io::{Error, ErrorKind, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, mpsc};
+#[cfg(target_os = "linux")]
+use std::thread;
 
 use super::common::{
     ArchiveRecorderError, ArchiveRecorderStats, AsyncIoBackend, EffectiveAsyncIoBackend,
@@ -55,16 +59,32 @@ enum PendingWriteKind {
 
 #[cfg(target_os = "linux")]
 pub(super) struct IoUringBackend {
-    ring: io_uring::IoUring,
+    ring: Arc<io_uring::IoUring>,
+    completion_rx: Option<mpsc::Receiver<IoUringCompletion>>,
+    completion_worker: Option<thread::JoinHandle<()>>,
     queue_depth: u32,
     submit_batch_max: u32,
     cqe_batch_max: u32,
     register_files_requested: bool,
     registered_file_slots: BTreeMap<RawFd, u32>,
     pending_writes: BTreeMap<u64, PendingWrite>,
+    direct_completions: BTreeMap<u64, i32>,
     pending_submit_count: u32,
     next_user_data: u64,
+    next_direct_user_data: u64,
     stats: IoUringBackendStats,
+}
+
+#[cfg(target_os = "linux")]
+const IO_URING_SHUTDOWN_USER_DATA: u64 = u64::MAX;
+#[cfg(target_os = "linux")]
+const IO_URING_DIRECT_USER_DATA_START: u64 = u64::MAX / 2;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct IoUringCompletion {
+    user_data: u64,
+    result: i32,
 }
 
 #[cfg(target_os = "linux")]
@@ -360,17 +380,33 @@ impl IoUringBackend {
         let queue_depth = queue_depth.max(1);
         let submit_batch_max = submit_batch_max.max(1).min(queue_depth);
         let cqe_batch_max = cqe_batch_max.max(1).min(queue_depth.saturating_mul(2));
+        let ring = Arc::new(io_uring::IoUring::new(queue_depth)?);
+        let use_completion_worker = io_uring_completion_worker_enabled();
+        let (completion_rx, completion_worker) = if use_completion_worker {
+            let (completion_tx, completion_rx) = mpsc::channel();
+            let completion_ring = Arc::clone(&ring);
+            let completion_worker = thread::Builder::new()
+                .name("iox2-log-archive-iouring-cq".to_string())
+                .spawn(move || completion_worker_loop(completion_ring, completion_tx))?;
+            (Some(completion_rx), Some(completion_worker))
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
-            ring: io_uring::IoUring::new(queue_depth)?,
+            ring,
+            completion_rx,
+            completion_worker,
             queue_depth,
             submit_batch_max,
             cqe_batch_max,
             register_files_requested,
             registered_file_slots: BTreeMap::new(),
             pending_writes: BTreeMap::new(),
+            direct_completions: BTreeMap::new(),
             pending_submit_count: 0,
             next_user_data: 1,
+            next_direct_user_data: IO_URING_DIRECT_USER_DATA_START,
             stats: IoUringBackendStats::default(),
         })
     }
@@ -598,7 +634,7 @@ impl IoUringBackend {
     fn push_write_entry(&mut self, user_data: u64) -> Result<(), ArchiveRecorderError> {
         loop {
             let entry = self.build_write_entry(user_data)?;
-            let mut sq = self.ring.submission();
+            let mut sq = unsafe { self.ring.submission_shared() };
             match unsafe { sq.push(&entry) } {
                 Ok(()) => {
                     self.pending_submit_count += 1;
@@ -692,14 +728,34 @@ impl IoUringBackend {
 
     fn wait_for_and_reap(&mut self, min_completions: usize) -> Result<(), ArchiveRecorderError> {
         self.stats.wait_calls = self.stats.wait_calls.saturating_add(1);
-        self.ring
-            .submit_and_wait(min_completions)
-            .map_err(|source| ArchiveRecorderError::Io {
-                operation: "wait for io_uring completion",
-                path: PathBuf::from("<io_uring>"),
-                source,
-            })?;
-        self.reap_completed()
+        if self.completion_rx.is_none() {
+            self.ring
+                .submit_and_wait(min_completions)
+                .map_err(|source| ArchiveRecorderError::Io {
+                    operation: "wait for io_uring completion",
+                    path: PathBuf::from("<io_uring>"),
+                    source,
+                })?;
+            self.reap_completed()?;
+            return Ok(());
+        }
+
+        let mut completed = self.reap_completed()?;
+        while completed < min_completions {
+            let completion = self
+                .completion_rx
+                .as_ref()
+                .expect("completion worker receiver must exist")
+                .recv()
+                .map_err(|source| ArchiveRecorderError::Io {
+                    operation: "wait for io_uring completion worker",
+                    path: PathBuf::from("<io_uring>"),
+                    source: Error::new(ErrorKind::BrokenPipe, source),
+                })?;
+            completed += self.handle_completion(completion)?;
+            completed += self.reap_completed()?;
+        }
+        Ok(())
     }
 
     fn wait_for_capacity(&mut self) -> Result<(), ArchiveRecorderError> {
@@ -711,46 +767,170 @@ impl IoUringBackend {
         self.wait_for_and_reap(completion_target.min(self.pending_writes.len()))
     }
 
-    fn reap_completed(&mut self) -> Result<(), ArchiveRecorderError> {
-        for _ in 0..self.cqe_batch_max {
-            let completion = {
-                let mut cq = self.ring.completion();
-                cq.next().map(|cqe| (cqe.user_data(), cqe.result()))
-            };
-            let Some((user_data, result)) = completion else {
-                break;
-            };
-
-            let mut pending = self.pending_writes.remove(&user_data).ok_or(
-                ArchiveRecorderError::RecoveryInconsistent("missing io_uring completion state"),
-            )?;
-            if result < 0 {
-                return Err(ArchiveRecorderError::Io {
-                    operation: pending.operation,
-                    path: pending.path,
-                    source: std::io::Error::from_raw_os_error(-result),
-                });
-            }
-            if result == 0 {
-                return Err(ArchiveRecorderError::Io {
-                    operation: pending.operation,
-                    path: pending.path,
-                    source: Error::new(ErrorKind::WriteZero, "io_uring write returned zero bytes"),
-                });
-            }
-
-            pending.written += result as usize;
-            let total_len = pending_total_len(&pending);
-            if pending.written < total_len {
-                refresh_pending_iovecs(&mut pending);
-                self.pending_writes.insert(user_data, pending);
-                self.push_write_entry(user_data)?;
-            } else {
-                self.stats.completed_writes = self.stats.completed_writes.saturating_add(1);
-            }
+    fn reap_completed(&mut self) -> Result<usize, ArchiveRecorderError> {
+        if self.completion_rx.is_none() {
+            return self.reap_ring_completed();
         }
 
-        Ok(())
+        let mut completed = 0usize;
+        for _ in 0..self.cqe_batch_max {
+            let completion = match self
+                .completion_rx
+                .as_ref()
+                .expect("completion worker receiver must exist")
+                .try_recv()
+            {
+                Ok(completion) => completion,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(ArchiveRecorderError::Io {
+                        operation: "read io_uring completion worker",
+                        path: PathBuf::from("<io_uring>"),
+                        source: Error::new(
+                            ErrorKind::BrokenPipe,
+                            "io_uring completion worker disconnected",
+                        ),
+                    });
+                }
+            };
+            completed += self.handle_completion(completion)?;
+        }
+
+        Ok(completed)
+    }
+
+    fn reap_ring_completed(&mut self) -> Result<usize, ArchiveRecorderError> {
+        let mut completed = 0usize;
+        for _ in 0..self.cqe_batch_max {
+            let completion = {
+                let mut cq = unsafe { self.ring.completion_shared() };
+                cq.next().map(|cqe| IoUringCompletion {
+                    user_data: cqe.user_data(),
+                    result: cqe.result(),
+                })
+            };
+            let Some(completion) = completion else {
+                break;
+            };
+            completed += self.handle_completion(completion)?;
+        }
+
+        Ok(completed)
+    }
+
+    fn handle_completion(
+        &mut self,
+        completion: IoUringCompletion,
+    ) -> Result<usize, ArchiveRecorderError> {
+        let IoUringCompletion { user_data, result } = completion;
+        if user_data >= IO_URING_DIRECT_USER_DATA_START {
+            self.direct_completions.insert(user_data, result);
+            return Ok(0);
+        }
+
+        let mut pending = self.pending_writes.remove(&user_data).ok_or(
+            ArchiveRecorderError::RecoveryInconsistent("missing io_uring completion state"),
+        )?;
+        if result < 0 {
+            return Err(ArchiveRecorderError::Io {
+                operation: pending.operation,
+                path: pending.path,
+                source: std::io::Error::from_raw_os_error(-result),
+            });
+        }
+        if result == 0 {
+            return Err(ArchiveRecorderError::Io {
+                operation: pending.operation,
+                path: pending.path,
+                source: Error::new(ErrorKind::WriteZero, "io_uring write returned zero bytes"),
+            });
+        }
+
+        pending.written += result as usize;
+        let total_len = pending_total_len(&pending);
+        if pending.written < total_len {
+            refresh_pending_iovecs(&mut pending);
+            self.pending_writes.insert(user_data, pending);
+            self.push_write_entry(user_data)?;
+            Ok(0)
+        } else {
+            self.stats.completed_writes = self.stats.completed_writes.saturating_add(1);
+            Ok(1)
+        }
+    }
+
+    fn next_direct_user_data(&mut self) -> u64 {
+        let user_data = self.next_direct_user_data;
+        self.next_direct_user_data =
+            if self.next_direct_user_data == IO_URING_SHUTDOWN_USER_DATA - 1 {
+                IO_URING_DIRECT_USER_DATA_START
+            } else {
+                self.next_direct_user_data + 1
+            };
+        user_data
+    }
+
+    fn submit_entry(&mut self, entry: io_uring::squeue::Entry) -> std::io::Result<()> {
+        loop {
+            let mut sq = unsafe { self.ring.submission_shared() };
+            match unsafe { sq.push(&entry) } {
+                Ok(()) => {
+                    drop(sq);
+                    self.ring.submit()?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    drop(sq);
+                    self.submit_pending().map_err(archive_to_io_error)?;
+                    self.wait_for_and_reap(1).map_err(archive_to_io_error)?;
+                }
+            }
+        }
+    }
+
+    fn wait_for_direct_completion(&mut self, user_data: u64) -> std::io::Result<i32> {
+        loop {
+            if let Some(result) = self.direct_completions.remove(&user_data) {
+                return Ok(result);
+            }
+            if let Some(completion_rx) = self.completion_rx.as_ref() {
+                let completion = completion_rx.recv().map_err(|source| {
+                    Error::new(
+                        ErrorKind::BrokenPipe,
+                        format!("io_uring completion worker disconnected: {source}"),
+                    )
+                })?;
+                self.handle_completion(completion)
+                    .map_err(archive_to_io_error)?;
+            } else {
+                self.ring.submit_and_wait(1)?;
+                self.reap_ring_completed().map_err(archive_to_io_error)?;
+            }
+        }
+    }
+
+    fn submit_shutdown(&mut self) -> std::io::Result<()> {
+        let entry = io_uring::opcode::Nop::new()
+            .build()
+            .user_data(IO_URING_SHUTDOWN_USER_DATA);
+        self.submit_entry(entry)
+    }
+
+    fn join_completion_worker(&mut self) {
+        if let Some(worker) = self.completion_worker.take() {
+            let _ = self.submit_shutdown();
+            let _ = worker.join();
+        }
+    }
+
+    unsafe fn submit_direct_and_wait_one(
+        &mut self,
+        entry: io_uring::squeue::Entry,
+    ) -> std::io::Result<i32> {
+        let user_data = self.next_direct_user_data();
+        let entry = entry.user_data(user_data);
+        self.submit_entry(entry)?;
+        self.wait_for_direct_completion(user_data)
     }
 
     fn record_enqueued_write(&mut self) {
@@ -760,31 +940,65 @@ impl IoUringBackend {
             .pending_high_watermark
             .max(self.pending_writes.len() as u64);
     }
+}
 
-    unsafe fn submit_direct_and_wait_one(
-        &mut self,
-        entry: io_uring::squeue::Entry,
-    ) -> std::io::Result<i32> {
+#[cfg(target_os = "linux")]
+impl Drop for IoUringBackend {
+    fn drop(&mut self) {
+        let _ = self.flush_pending();
+        self.join_completion_worker();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn completion_worker_loop(
+    ring: Arc<io_uring::IoUring>,
+    completion_tx: mpsc::Sender<IoUringCompletion>,
+) {
+    loop {
+        if ring.submitter().submit_and_wait(1).is_err() {
+            return;
+        }
+
         loop {
-            let mut sq = self.ring.submission();
-            // SAFETY: The entry owns its buffer/file descriptor metadata for this
-            // synchronous direct operation and is not reused until the CQE is read.
-            match unsafe { sq.push(&entry) } {
-                Ok(()) => break,
-                Err(_) => {
-                    drop(sq);
-                    self.ring.submit()?;
-                }
+            let completion = {
+                let mut cq = unsafe { ring.completion_shared() };
+                cq.next().map(|cqe| IoUringCompletion {
+                    user_data: cqe.user_data(),
+                    result: cqe.result(),
+                })
+            };
+            let Some(completion) = completion else {
+                break;
+            };
+
+            if completion.user_data == IO_URING_SHUTDOWN_USER_DATA {
+                return;
+            }
+            if completion_tx.send(completion).is_err() {
+                return;
             }
         }
-        self.ring.submit_and_wait(1)?;
-        let mut cq = self.ring.completion();
-        let Some(cqe) = cq.next() else {
-            return Err(Error::other(
-                "io_uring direct operation returned without completion",
-            ));
-        };
-        Ok(cqe.result())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_completion_worker_enabled() -> bool {
+    std::env::var("IOX2_LOG_ARCHIVE_IO_URING_COMPLETION_WORKER")
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn archive_to_io_error(error: ArchiveRecorderError) -> Error {
+    match error {
+        ArchiveRecorderError::Io { source, .. } => source,
+        other => Error::other(format!("{other:?}")),
     }
 }
 

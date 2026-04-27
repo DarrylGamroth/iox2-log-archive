@@ -254,6 +254,44 @@ Interpretation:
   preparation from I/O completion handling so large writes can stay queued while
   the recorder prepares subsequent records.
 
+## Experimental Completion-Worker Checkpoint
+
+Branch `iouring-completion-worker` adds an opt-in CQ worker:
+
+```bash
+IOX2_LOG_ARCHIVE_IO_URING_COMPLETION_WORKER=1 \
+BACKEND=io_uring_required \
+crates/core/scripts/run_throughput_profile_benchmark.sh \
+  target/benchmarks/core-throughput-cq-worker
+```
+
+Design shape:
+
+- Recorder thread owns frame construction, submission queue pushes, pending
+  write buffers, and external payload owner guards.
+- A dedicated Linux worker thread waits on the completion queue and forwards CQE
+  results back to the recorder thread.
+- Flush, sync, segment roll, and finalize remain explicit barriers.
+- The mode is not enabled by default because external payload guards are not
+  moved across threads and because the first benchmark result is mixed.
+
+Host `spiders`, `/mnt/datadrive/tmp`, 256-deep io_uring queue, 64-submit batch,
+128-CQE batch, worker enabled:
+
+| Path | Payload | Prior batch-drain io_uring | CQ worker io_uring |
+| --- | ---: | ---: | ---: |
+| Core synthetic | 4 KiB | `~594.9 MB/s` | `~535.2 MB/s` |
+| Core synthetic | 16 KiB | `~817.1 MB/s` | `~712.2 MB/s` |
+| Core synthetic | 1 MiB | `~654.4 MB/s` | `~657.1 MB/s` |
+| Pub-sub loan | 4 KiB | `~539.0 MB/s` | `~562.3 MB/s` |
+| Pub-sub loan | 16 KiB | `~807.5 MB/s` | `~741.0 MB/s` |
+| Pub-sub loan | 1 MiB | `~827.5 MB/s` | `~805.0 MB/s` |
+
+Interpretation: the completion worker is functionally valid but not a clear
+throughput win. It improves the 4 KiB live pub-sub case in this run, is neutral
+for core 1 MiB, and regresses several other paths. Keep it experimental unless
+future target hardware shows consistent benefit.
+
 ## Reproduce
 
 The checked-in benchmark entry points are:
