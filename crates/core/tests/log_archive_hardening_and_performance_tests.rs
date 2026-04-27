@@ -22,9 +22,10 @@ use std::time::Duration;
 
 use iceoryx2_bb_testing::assert_that;
 use iox2_log_archive_core::log_archive::{
-    ArchiveRecorderBuilder, ArchiveRecorderError, ArchiveReplayerBuilder, AsyncIoBackend,
-    ChecksumMode, EffectiveAsyncIoBackend, PersistenceMode, PublishSubscribeRecordInput,
-    RecorderProfile, ReplayBudget,
+    ArchiveRecorderBuilder, ArchiveRecorderError, ArchiveReplayerBuilder, ArchiveSourcePattern,
+    AsyncIoBackend, ChecksumMode, EffectiveAsyncIoBackend, PersistenceMode,
+    PublishSubscribeExternalPayloadInput, PublishSubscribeRecordInput, RecorderProfile,
+    ReplayBudget, ReplayFrameBuffer, decode_adapter_user_header,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -215,6 +216,134 @@ fn log_archive_phase6_backend_parity_between_blocking_and_io_uring() {
         assert_that!(blocking_backend, eq EffectiveAsyncIoBackend::Blocking);
         assert_that!(io_uring_backend, eq EffectiveAsyncIoBackend::IoUring);
         assert_that!(io_uring_replay, eq blocking_replay);
+    }
+}
+
+#[test]
+fn log_archive_phase6_io_uring_external_payload_writev_persists_records() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if io_uring::IoUring::new(8).is_err() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage_path = temp.path().join("archive");
+        let metadata_path = temp.path().join("metadata");
+        let record_count = 64u64;
+        let payload_len = 4096usize;
+
+        let mut recorder = ArchiveRecorderBuilder::new(&storage_path)
+            .metadata_log_path(&metadata_path)
+            .profile(RecorderProfile::Throughput)
+            .segment_bytes(512 * 1024)
+            .segment_preallocate(false)
+            .spare_preallocated_segments(0)
+            .persistence_mode(PersistenceMode::Async)
+            .checksum_mode(ChecksumMode::Crc32c)
+            .async_io_backend(AsyncIoBackend::IoUringRequired)
+            .io_uring_queue_depth(32)
+            .io_submit_batch_max(8)
+            .io_cqe_batch_max(32)
+            .create()
+            .unwrap();
+        assert_that!(
+            recorder.effective_async_io_backend(),
+            eq EffectiveAsyncIoBackend::IoUring
+        );
+
+        for sequence in 1..=record_count {
+            let mut payload = vec![0u8; payload_len];
+            fill_payload(sequence, &mut payload);
+            let payload_owner = Box::new(payload);
+            let payload_ptr = payload_owner.as_ptr();
+            let payload_len = payload_owner.len();
+            let user_header = [sequence as u8, (sequence >> 8) as u8, 0xC0, 0xDE];
+
+            unsafe {
+                recorder.append_publish_subscribe_external_payload_record(
+                    PublishSubscribeExternalPayloadInput {
+                        event_time_ns: sequence * 100,
+                        source_service_id: 0xA11CE,
+                        source_publisher_id: 0xB0B,
+                        source_sequence: Some(sequence),
+                        user_header: &user_header,
+                        payload_ptr,
+                        payload_len,
+                        payload_owner,
+                    },
+                )
+            }
+            .unwrap();
+        }
+        recorder.finalize().unwrap();
+
+        let replayer = ArchiveReplayerBuilder::new(&storage_path)
+            .metadata_log_path(&metadata_path)
+            .open()
+            .unwrap();
+        let replayed = replayer
+            .read_range(1, NonZeroUsize::new(record_count as usize).unwrap())
+            .unwrap();
+
+        assert_that!(replayed.len(), eq record_count as usize);
+        let mut replay_buffer = ReplayFrameBuffer::with_capacity(payload_len + 128);
+        assert_that!(
+            replayer
+                .read_at_sequence_into(record_count + 1, &mut replay_buffer)
+                .unwrap()
+                .is_none(),
+            eq true
+        );
+        for (index, frame) in replayed.iter().enumerate() {
+            let sequence = index as u64 + 1;
+            assert_that!(frame.sequence, eq sequence);
+            assert_that!(frame.payload.len(), eq payload_len);
+            assert_that!(frame.payload[0], eq payload_byte(sequence, 0));
+            assert_that!(
+                frame.payload[payload_len / 2],
+                eq payload_byte(sequence, payload_len / 2)
+            );
+            assert_that!(
+                frame.payload[payload_len - 1],
+                eq payload_byte(sequence, payload_len - 1)
+            );
+            assert_that!(frame.frame_checksum == 0, eq false);
+
+            let decoded = decode_adapter_user_header(&frame.user_header).unwrap();
+            assert_that!(
+                decoded.source_metadata.source_pattern,
+                eq ArchiveSourcePattern::PublishSubscribe
+            );
+            assert_that!(decoded.source_metadata.source_service_id, eq 0xA11CE);
+            assert_that!(decoded.source_metadata.source_instance_id, eq 0xB0B);
+            assert_that!(decoded.source_metadata.source_sequence, eq Some(sequence));
+            assert_that!(
+                decoded.user_header.to_vec(),
+                eq vec![sequence as u8, (sequence >> 8) as u8, 0xC0, 0xDE]
+            );
+
+            let borrowed = replayer
+                .read_at_sequence_into(sequence, &mut replay_buffer)
+                .unwrap()
+                .unwrap();
+            assert_that!(borrowed.sequence, eq sequence);
+            assert_that!(borrowed.payload.len(), eq payload_len);
+            assert_that!(borrowed.payload[0], eq payload_byte(sequence, 0));
+            assert_that!(
+                borrowed.payload[payload_len - 1],
+                eq payload_byte(sequence, payload_len - 1)
+            );
+            assert_that!(
+                borrowed.user_header.to_vec(),
+                eq frame.user_header.clone()
+            );
+        }
     }
 }
 
